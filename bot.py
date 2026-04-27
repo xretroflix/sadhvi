@@ -1,5 +1,5 @@
 # VB Membership Bot
-# - No URL previews (uses WebApp buttons — opens directly)
+# - Opens payment in external browser, returns to bot via deep link
 # - Everything stays in bot — no website success page
 # - PhonePe return URL deep-links back to bot
 # - Auto-deletes messages after 20 min
@@ -8,9 +8,8 @@
 
 import os, hashlib, asyncio, logging, json
 from datetime import datetime, timedelta, timezone
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-from telegram.ext import (ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-                           MessageHandler, ContextTypes, filters as tgfilters)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.error import BadRequest, Forbidden
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import httpx
@@ -55,17 +54,12 @@ PLANS = {
 }
 
 def pay_url(uid, plan, billing='monthly'):
-    """
-    PhonePe return URL deep-links back to bot after payment.
-    tg://resolve?domain=BOT&start=paid_ORDERID
-    """
-    ph  = det_phone(uid)
+    ph  = det_phone(uid)          # always 10 digits, no +91
     nm  = det_name(uid).replace(' ', '+')
-    oid = f"VBM{uid}{plan[0].upper()}{int(asyncio.get_event_loop().time()*1000) % 100000}"
     b   = 'yearly' if billing == 'yearly' else 'monthly'
     return (
         f"{STORE_URL}/membership"
-        f"?ph={ph}&plan={plan}&billing={b}&name={nm}&tgid={uid}&oid={oid}&silent=1"
+        f"?ph={ph}&plan={plan}&billing={b}&name={nm}&tgid={uid}&silent=1"
     )
 
 def plan_kb(billing='monthly'):
@@ -73,9 +67,7 @@ def plan_kb(billing='monthly'):
     rows  = [
         [InlineKeyboardButton(
             f"{p['label']} — ₹{p['price']}/mo" if billing == 'monthly' else f"{p['label']} — ₹{p['yearly']}/yr",
-            web_app=WebAppInfo(url=(
-                f"{STORE_URL}/membership?plan={k}&billing={billing}&silent=1"
-            ))
+            callback_data=f"plan:{k}:{billing}"
         )]
         for k, p in PLANS.items()
     ]
@@ -155,35 +147,67 @@ async def kick_user(bot, tg_id, plan):
     except Exception as e:
         log.warning(f"Kick failed uid={tg_id}: {e}")
 
+
+async def verify_payment(tg_uid: int) -> dict | None:
+    """
+    Verify payment by matching telegram_id in payment_transactions.
+    Returns the latest completed transaction for this user.
+    """
+    rows = await sb(
+        f"/payment_transactions?telegram_id=eq.{tg_uid}&state=eq.COMPLETED"
+        f"&select=order_id,utr,vpa,plan,amount_paid,received_at"
+        f"&order=received_at.desc&limit=1"
+    )
+    return rows[0] if rows else None
+
+async def get_member_by_tgid(tg_uid: int) -> dict | None:
+    rows = await sb(f"/members?telegram_id=eq.{tg_uid}&select=status,plan,expires_at,token&limit=1")
+    return rows[0] if rows else None
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid    = update.effective_user.id
     args   = ctx.args or []
     phone  = det_phone(uid)
 
-    # ── Handle deep-link return from PhonePe ──────────────────────
-    # /start paid_ORDERID  — payment completed, show Join button
-    if args and args[0].startswith('paid_'):
-        oid    = args[0][5:]
-        member = await get_member(phone)
-        plan   = member.get('plan', 'purple') if member else 'purple'
-        ch     = await get_channel_link(plan)
-
-        # Delete previous messages from this session
+    # ── /start verify — user tapped "Back to Bot" after paying ───
+    # Verify via UTR + telegram_id in Supabase
+    if args and args[0] == 'verify':
         for mid in ctx.user_data.pop('msg_ids', []):
             await del_msg(ctx.bot, uid, mid)
 
-        kb = [[InlineKeyboardButton('Join', url=ch)]] if ch else []
-        msg = await update.message.reply_text(
-            '✅ *Done!*',
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(kb) if kb else None
-        )
+        txn = await verify_payment(uid)
+        if txn and txn.get('utr'):
+            plan = txn.get('plan') or 'purple'
+            ch   = await get_channel_link(plan)
+            kb   = [[InlineKeyboardButton('Join', url=ch)]] if ch else []
+            msg  = await update.message.reply_text(
+                '✅ *Done!*',
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(kb) if kb else None
+            )
+        else:
+            # Check if member is active even without recent txn
+            member = await get_member_by_tgid(uid)
+            if member and member.get('status') == 'active':
+                plan = member.get('plan','purple')
+                ch   = await get_channel_link(plan)
+                kb   = [[InlineKeyboardButton('Join', url=ch)]] if ch else []
+                msg  = await update.message.reply_text(
+                    '✅ *Done!*',
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None
+                )
+            else:
+                msg = await update.message.reply_text(
+                    'Payment not confirmed yet. If you paid, wait a moment and tap /start again.',
+                    reply_markup=plan_kb()
+                )
         sched_del(ctx.bot, msg)
         return
 
     # ── Normal /start ─────────────────────────────────────────────
-    member = await get_member(phone)
+    member = await get_member_by_tgid(uid) or await get_member(phone)
 
     # Active member — show Join + renew
     if member and member.get('status') == 'active' and 'retry' not in args:
@@ -233,52 +257,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 f"₹{amt}/{per}",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f'Pay ₹{amt} →', web_app=WebAppInfo(url=link))],
+                    [InlineKeyboardButton(f'Pay ₹{amt} →', url=link)],
                     [InlineKeyboardButton('← Back', callback_data=f'billing:{billing}')],
                 ])
             )
         except BadRequest: pass
-
-# ── WebApp data handler — fires when payment completes in WebApp ──────────────
-async def on_webapp_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Receives data sent from the payment page via Telegram.sendData().
-    Payload: {"status":"paid","plan":"purple","oid":"VBM..."}
-    """
-    uid  = update.effective_user.id
-    raw  = update.effective_message.web_app_data.data if update.effective_message.web_app_data else None
-    if not raw: return
-
-    try:    data = json.loads(raw)
-    except: return
-
-    status = data.get('status')
-    plan   = data.get('plan', 'purple')
-    phone  = det_phone(uid)
-
-    # Delete all previous plan selection messages
-    for mid in ctx.user_data.pop('msg_ids', []):
-        await del_msg(ctx.bot, uid, mid)
-
-    if status == 'paid':
-        # Ensure telegram_id is saved on member
-        await save_member_tg(uid, phone, plan)
-        ch  = await get_channel_link(plan)
-        kb  = [[InlineKeyboardButton('Join', url=ch)]] if ch else []
-        msg = await update.message.reply_text(
-            '✅ *Done!*',
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(kb) if kb else None
-        )
-        sched_del(ctx.bot, msg)
-    else:
-        # Failed — show plan selection again
-        msg = await update.message.reply_text(
-            'Payment not completed. Try again 👇',
-            reply_markup=plan_kb()
-        )
-        sched_del(ctx.bot, msg)
-        ctx.user_data.setdefault('msg_ids', []).append(msg.message_id)
 
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
 async def job_remind(bot):
@@ -429,7 +412,7 @@ def main():
     app.add_handler(CommandHandler('broadcast_expired', broadcast_expired))
     app.add_handler(CommandHandler('stats',             stats))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(tgfilters.StatusUpdate.WEB_APP_DATA, on_webapp_data))
+
 
     sched = AsyncIOScheduler(timezone='Asia/Kolkata')
     sched.add_job(job_remind, 'cron', hour=9,  minute=0,  args=[app.bot])
