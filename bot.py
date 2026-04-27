@@ -6,7 +6,7 @@
 # - Saves full data to Supabase (tgid, phone, plan, UTR, VPA)
 # - Admin broadcast with filters
 
-import os, hashlib, asyncio, logging, json
+import os, hashlib, asyncio, logging, json, secrets
 from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -164,6 +164,24 @@ async def get_member_by_tgid(tg_uid: int) -> dict | None:
     rows = await sb(f"/members?telegram_id=eq.{tg_uid}&select=status,plan,expires_at,token&limit=1")
     return rows[0] if rows else None
 
+
+def gen_join_token(tg_uid: int, utr: str) -> str:
+    """Generate a short opaque token for the /api/join redirect."""
+    raw = f"vbjoin_{tg_uid}_{utr}_{secrets.token_hex(4)}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+async def save_join_token(phone: str, tg_uid: int, token: str):
+    await sb(f"/members?phone=eq.{phone}", 'PATCH', {
+        'join_token': token,
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    })
+
+async def save_join_token_by_tgid(tg_uid: int, token: str):
+    await sb(f"/members?telegram_id=eq.{tg_uid}", 'PATCH', {
+        'join_token': token,
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    })
+
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid    = update.effective_user.id
@@ -176,33 +194,25 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for mid in ctx.user_data.pop('msg_ids', []):
             await del_msg(ctx.bot, uid, mid)
 
-        txn = await verify_payment(uid)
-        if txn and txn.get('utr'):
-            plan = txn.get('plan') or 'purple'
-            ch   = await get_channel_link(plan)
-            kb   = [[InlineKeyboardButton('Join', url=ch)]] if ch else []
-            msg  = await update.message.reply_text(
-                '✅ *Done!*',
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup(kb) if kb else None
+        txn    = await verify_payment(uid)
+        member = await get_member_by_tgid(uid) if not txn else None
+        is_ok  = (txn and txn.get('utr')) or (member and member.get('status') == 'active')
+
+        if is_ok:
+            # Generate opaque join token — button URL hides real channel link
+            utr = txn.get('utr', 'noutr') if txn else 'noutr'
+            jt  = gen_join_token(uid, utr)
+            await save_join_token_by_tgid(uid, jt)
+            join_url = f'{STORE_URL}/api/join?t={jt}'
+            msg = await update.message.reply_text(
+                '✅',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Join', url=join_url)]])
             )
         else:
-            # Check if member is active even without recent txn
-            member = await get_member_by_tgid(uid)
-            if member and member.get('status') == 'active':
-                plan = member.get('plan','purple')
-                ch   = await get_channel_link(plan)
-                kb   = [[InlineKeyboardButton('Join', url=ch)]] if ch else []
-                msg  = await update.message.reply_text(
-                    '✅ *Done!*',
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup(kb) if kb else None
-                )
-            else:
-                msg = await update.message.reply_text(
-                    'Payment not confirmed yet. If you paid, wait a moment and tap /start again.',
-                    reply_markup=plan_kb()
-                )
+            msg = await update.message.reply_text(
+                'Not confirmed yet. If you paid, wait a moment and tap /start again.',
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Try again', callback_data='billing:monthly')]])
+            )
         sched_del(ctx.bot, msg)
         return
 
@@ -213,9 +223,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if member and member.get('status') == 'active' and 'retry' not in args:
         exp  = member.get('expires_at', '')[:10]
         plan = member.get('plan', 'purple')
-        ch   = await get_channel_link(plan)
-        kb   = [[InlineKeyboardButton('🔄 Renew', callback_data='billing:monthly')]]
-        if ch: kb.insert(0, [InlineKeyboardButton('Join', url=ch)])
+        ph   = det_phone(uid)
+        # Generate fresh join token
+        jt   = gen_join_token(uid, str(uid))
+        await save_join_token_by_tgid(uid, jt)
+        join_url = f'{STORE_URL}/api/join?t={jt}'
+        kb = [
+            [InlineKeyboardButton('Join', url=join_url)],
+            [InlineKeyboardButton('🔄 Renew', callback_data='billing:monthly')],
+        ]
         msg  = await update.message.reply_text(
             f"Active — expires {exp}",
             reply_markup=InlineKeyboardMarkup(kb)
@@ -296,7 +312,7 @@ async def job_expire(bot):
             try:
                 msg = await bot.send_message(
                     chat_id=int(tgid),
-                    text="Membership expired — renew to rejoin 👇",
+                    text="Expired — renew to rejoin 👇",
                     reply_markup=plan_kb()
                 )
                 sched_del(bot, msg, delay=86400)
