@@ -711,23 +711,12 @@ def schedule_auto_wipe(context, user_id, minutes):
     )
 
 def reset_user_data(user_id: int):
-    """Completely erase ALL records for user - full nuclear reset.
-    Deletes:
-    - User account from users table
-    - All purchases
-    - Blocked status
-    - All user messages
-    
-    User can then /start again as if they never used the bot."""
+    """Delete all purchases + reset menu/main message refs for a user."""
     with db() as conn:
-        # Delete all references to this user
         conn.execute("DELETE FROM purchases WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM blocked_users WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM user_messages WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-        conn.commit()
-    
-    log.info(f"reset_user_data: Completely erased all records for user {user_id}")
+        conn.execute(
+            "UPDATE users SET tracked_msgs='[]', menu_msg_id=NULL "
+            "WHERE user_id=?", (user_id,))
 
 async def full_reset(context, user_id: int):
     """Wipe ALL bot messages from user's chat AND reset DB state.
@@ -915,28 +904,6 @@ async def cmd_start(update, context):
                     f"🔒 {c['name']} — ₹{price}",
                     callback_data=f"buy:{c['id']}",
                 )])
-        
-        # Show unowned bundles as upgrades (locked 🔒)
-        # Only show bundles with HIGHER price than what user already owns
-        if owned_bundle_prices:
-            max_owned_bundle = max(owned_bundle_prices)
-            for price in sorted(BUNDLES.keys()):
-                if price > max_owned_bundle and price not in owned_bundle_prices:
-                    bundle = BUNDLES[price]
-                    rows.append([InlineKeyboardButton(
-                        f"🔒 {bundle['name']} — ₹{price}",
-                        callback_data=f"buy_bundle:{price}",
-                    )])
-        else:
-            # User has no bundles, show all bundles as upgrades
-            # (but exclude ₹99 if they already own Channel 1)
-            if CHANNELS[0]["id"] not in owned_channel_ids:
-                for price in sorted(BUNDLES.keys()):
-                    bundle = BUNDLES[price]
-                    rows.append([InlineKeyboardButton(
-                        f"🔒 {bundle['name']} — ₹{price}",
-                        callback_data=f"buy_bundle:{price}",
-                    )])
 
 
     # Try to EDIT the existing menu message in-place (keeps bot sticky).
@@ -989,19 +956,17 @@ async def cb_fallback_menu(update, context):
     if is_blocked(user.id):
         return
     
-    # Bundle options: (display_name, price_rupees, callback_data)
+    # Bundle options: (display_name, price_rupees)
     bundles = [
-        ("1 Channel", 30, "buy_bundle:30"),
-        ("5 Channels", 59, "buy_bundle:59"),
-        ("10 Channels", 79, "buy_bundle:79"),
-        # Note: 15 Channels at ₹99 is same as main Tier 1 (Channel 1)
-        # Use same handler for identical behavior and logic
-        ("15 Channels", 99, "buy:1"),  # Uses main channel handler, not bundle
+        ("1 Channel", 30),
+        ("5 Channels", 59),
+        ("10 Channels", 79),
+        ("15 Channels", 99),
     ]
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=callback)]
-        for name, price, callback in bundles
+        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
+        for name, price in bundles
     ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
     
     text = (f"<b>💰 Budget Bundles</b>\n\n"
@@ -1050,21 +1015,20 @@ async def cb_buy_bundle(update, context):
     pid = create_purchase(user.id, bundle_channel, qr_idx)
     
     # Delete the menu message (transitioning to QR flow)
-    # Note: Keep menu_msg_id so state refresh after approval can update it!
     try:
         await q.message.delete()
     except Exception:
         pass
-    # Don't set menu_msg_id to NULL - it will be refreshed after approval
+    with db() as conn:
+        conn.execute("UPDATE users SET menu_msg_id=NULL WHERE user_id=?", (user.id,))
     await clear_tracked(context, user.id)
     
-    # Send QR with "I've Paid" button and Back option
+    # Send QR with "I've Paid" button
     caption = (
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}"),
-        InlineKeyboardButton("⬅️ Back", callback_data="fallback_menu")
+        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
     ]])
     
     with open(qr_path, "rb") as fh:
@@ -1119,25 +1083,6 @@ async def cb_back_to_start(update, context):
     
     # Trigger /start flow
     await cmd_start(update, context)
-
-
-async def cb_bundle_back_menu(update, context):
-    """Go back from QR payment screen to fallback menu."""
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
-    
-    if is_blocked(user.id):
-        return
-    
-    # Delete the QR message
-    try:
-        await q.delete_message()
-    except Exception:
-        pass
-    
-    # Call fallback menu directly to show it fresh
-    await cb_fallback_menu(update, context)
 
 
 # ==================================================================
@@ -1199,12 +1144,14 @@ async def cb_buy(update, context):
         return
 
     # Delete the menu message (we're transitioning to the QR flow).
-    # Note: Keep menu_msg_id so state refresh after approval can update it!
+    # Clear menu_msg_id since it no longer exists.
     try:
         await q.message.delete()
     except Exception:
         pass
-    # Don't set menu_msg_id to NULL - it will be refreshed after approval
+    with db() as conn:
+        conn.execute("UPDATE users SET menu_msg_id=NULL WHERE user_id=?",
+                     (user.id,))
     await clear_tracked(context, user.id)
 
     # QR photo: short helpful caption, NO protect_content.
@@ -1724,7 +1671,7 @@ async def cb_admin(update, context):
                                 f"✅ {bundle['name']}", url=bundle["link"]
                             )])
                     
-                    # Show upgrades - unowned channels
+                    # Show upgrades
                     for c in CHANNELS:
                         if c["id"] not in owned_channel_ids:
                             price = c["price"]
@@ -1732,51 +1679,12 @@ async def cb_admin(update, context):
                                 f"🔒 {c['name']} — ₹{price}",
                                 callback_data=f"buy:{c['id']}",
                             )])
-                    
-                    # Show bundle upgrades - higher-priced bundles only
-                    if owned_bundle_prices:
-                        max_owned_bundle = max(owned_bundle_prices)
-                        for price in sorted(BUNDLES.keys()):
-                            if price > max_owned_bundle and price not in owned_bundle_prices:
-                                bundle = BUNDLES[price]
-                                rows.append([InlineKeyboardButton(
-                                    f"🔒 {bundle['name']} — ₹{price}",
-                                    callback_data=f"buy_bundle:{price}",
-                                )])
-                    else:
-                        # User has no bundles, show all bundles as upgrades
-                        # (but exclude ₹99 if they already own Channel 1)
-                        if CHANNELS[0]["id"] not in owned_channel_ids:
-                            for price in sorted(BUNDLES.keys()):
-                                bundle = BUNDLES[price]
-                                rows.append([InlineKeyboardButton(
-                                    f"🔒 {bundle['name']} — ₹{price}",
-                                    callback_data=f"buy_bundle:{price}",
-                                )])
                 
                 # Try to refresh the menu in-place (live update)
-                success = await edit_main(
+                await edit_main(
                     context, user_id, menu_row["menu_msg_id"],
                     intro, reply_markup=InlineKeyboardMarkup(rows)
                 )
-                
-                # If edit failed (message deleted or invalid), send fresh message
-                if not success:
-                    try:
-                        m = await context.bot.send_message(
-                            chat_id=user_id, text=intro, parse_mode=ParseMode.HTML,
-                            reply_markup=InlineKeyboardMarkup(rows),
-                            disable_notification=True,
-                        )
-                        # Update menu_msg_id with the new message
-                        with db() as conn:
-                            conn.execute(
-                                "UPDATE users SET menu_msg_id=? WHERE user_id=?",
-                                (m.message_id, user_id))
-                        delivered = True
-                    except Exception as e2:
-                        log.debug(f"Failed to send fresh menu after edit failure: {e2}")
-                        delivered = False
         except Exception as e:
             log.debug(f"Failed to refresh /start menu: {e}")
             # Silently ignore — if refresh fails, user can still tap /start manually
@@ -2209,12 +2117,7 @@ async def cmd_help(update, context):
         "<b>💾 DB backup</b>\n"
         "/backup — get fresh DB file\n"
         "/restore — reply to a .db file to restore\n"
-        "/import_csv — upload CSV to import purchase records\n"
-        "/export_csv — download complete CSV export\n\n"
-
-        "<b>👤 User data</b>\n"
-        "/update_user &lt;user_id&gt; &lt;channel_id&gt; &lt;amount&gt; [status] — manually update/create user record\n"
-        "  Example: <code>/update_user 6242890869 1 99 approved</code>\n\n"
+        "/import_csv — upload master_summary.csv to import purchase records\n\n"
 
         "<i>Inline buttons on admin notifications:</i>\n"
         "✅ Approve · ❌ Reject · 📸 Request Screenshot\n"
@@ -3903,190 +3806,6 @@ async def on_csv_import_file(update, context):
         log.error(f"CSV import error: {e}")
 
 
-async def cmd_update_user(update, context):
-    """Admin: /update_user <user_id> <channel_id> <amount> [status] — Manually update user's purchase record."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_html(
-            "❌ Usage: <code>/update_user &lt;user_id&gt; &lt;channel_id&gt; &lt;amount&gt; [status]</code>\n\n"
-            "Status options: <code>approved</code>, <code>pending</code>, <code>rejected</code>\n\n"
-            "Example:\n"
-            "<code>/update_user 6242890869 1 99 approved</code>"
-        )
-        return
-    
-    try:
-        user_id = int(args[0])
-        channel_id = int(args[1])
-        amount = int(args[2])
-        status = args[3].lower() if len(args) > 3 else "approved"
-        
-        if status not in ["approved", "pending", "rejected"]:
-            await update.message.reply_text("❌ Invalid status. Use: approved, pending, rejected")
-            return
-        
-        with db() as conn:
-            # Find channel name
-            channel_name = "Unknown Channel"
-            for c in CHANNELS:
-                if c["id"] == channel_id:
-                    channel_name = c["name"]
-                    break
-            
-            # Check if purchase exists for this user
-            existing = conn.execute(
-                "SELECT id FROM purchases WHERE user_id=? AND channel_id=?",
-                (user_id, channel_id)
-            ).fetchone()
-            
-            now = datetime.utcnow().isoformat()
-            
-            if existing:
-                # Update existing record
-                pid = existing["id"]
-                approved_at = now if status == "approved" else None
-                rejected_at = now if status == "rejected" else None
-                
-                conn.execute("""
-                    UPDATE purchases 
-                    SET status=?, approved_at=?, rejected_at=?, upi_submitted_at=?
-                    WHERE id=?
-                """, (status, approved_at, rejected_at, now, pid))
-                
-                action = "updated"
-            else:
-                # Create new record
-                conn.execute("""
-                    INSERT INTO purchases 
-                    (user_id, channel_id, channel_name, amount, status, created_at, 
-                     upi_submitted_at, approved_at, rejected_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (user_id, channel_id, channel_name, amount, status, now, now,
-                      now if status == "approved" else None,
-                      now if status == "rejected" else None))
-                
-                action = "created"
-            
-            # Ensure user exists
-            conn.execute("""
-                INSERT OR IGNORE INTO users (user_id)
-                VALUES (?)
-            """, (user_id,))
-            
-            conn.commit()
-        
-        msg = (
-            f"✅ <b>Record {action}</b>\n\n"
-            f"👤 User: <code>{user_id}</code>\n"
-            f"📺 Channel: {channel_name} (ID: {channel_id})\n"
-            f"💰 Amount: ₹{amount}\n"
-            f"📊 Status: <b>{status.upper()}</b>"
-        )
-        await update.message.reply_html(msg)
-        
-        # Refresh user's /start menu if approved
-        if status == "approved":
-            try:
-                await cmd_start(
-                    Update(user_id=user_id, effective_user=context.bot),
-                    context
-                )
-            except:
-                pass  # Silent fail if user hasn't started bot
-        
-        log.info(f"Manual record {action} for user {user_id}: {channel_name} ₹{amount} ({status})")
-        
-    except ValueError:
-        await update.message.reply_text("❌ Invalid numbers for user_id, channel_id, or amount")
-    except Exception as e:
-        await update.message.reply_html(f"❌ Error: <code>{str(e)}</code>")
-
-
-async def cmd_export_csv(update, context):
-    """Admin: /export_csv — Export complete CSV of all purchase records to current date."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    try:
-        await update.message.reply_text("📊 Generating CSV export... please wait")
-        
-        with db() as conn:
-            # Get all purchase records
-            purchases = conn.execute("""
-                SELECT 
-                    id as PurchaseID,
-                    created_at as CreatedAt,
-                    user_id as UserID,
-                    (SELECT first_name FROM users u WHERE u.user_id = purchases.user_id) as Name,
-                    (SELECT username FROM users u WHERE u.user_id = purchases.user_id) as Username,
-                    channel_name as Channel,
-                    amount as Amount,
-                    qr_used as QR,
-                    upi_name as UPIName,
-                    status as Status,
-                    approved_at as ApprovedAt,
-                    rejected_at as RejectedAt
-                FROM purchases
-                ORDER BY created_at DESC
-            """).fetchall()
-        
-        if not purchases:
-            await update.message.reply_text("❌ No purchase records found!")
-            return
-        
-        # Create CSV content
-        output = io.StringIO()
-        fieldnames = [
-            "PurchaseID", "CreatedAt", "UserID", "Name", "Username", 
-            "Channel", "Amount", "QR", "UPIName", "Status", "ApprovedAt", "RejectedAt"
-        ]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        
-        for purchase in purchases:
-            row = {
-                "PurchaseID": purchase["PurchaseID"],
-                "CreatedAt": purchase["CreatedAt"] or "",
-                "UserID": purchase["UserID"],
-                "Name": purchase["Name"] or "",
-                "Username": purchase["Username"] or "",
-                "Channel": purchase["Channel"] or "",
-                "Amount": purchase["Amount"] or "",
-                "QR": purchase["QR"] or "",
-                "UPIName": purchase["UPIName"] or "",
-                "Status": purchase["Status"] or "",
-                "ApprovedAt": purchase["ApprovedAt"] or "",
-                "RejectedAt": purchase["RejectedAt"] or "",
-            }
-            writer.writerow(row)
-        
-        # Generate filename with timestamp
-        timestamp = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"export_summary_{timestamp}.csv"
-        
-        # Send file
-        csv_bytes = output.getvalue().encode('utf-8-sig')
-        input_file = InputFile(BytesIO(csv_bytes), filename=filename)
-        
-        await update.message.reply_document(
-            document=input_file,
-            caption=f"📊 <b>Export Summary</b>\n\n"
-                    f"📝 Records: {len(purchases)}\n"
-                    f"📅 Generated: {datetime.now(TZ).strftime('%d-%b-%Y %H:%M:%S')} IST\n"
-                    f"📥 Filename: <code>{filename}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        
-        log.info(f"CSV exported: {len(purchases)} records in {filename}")
-        
-    except Exception as e:
-        await update.message.reply_html(f"❌ Export error: <code>{str(e)}</code>")
-        log.error(f"CSV export error: {e}")
-
-
 async def cmd_restore(update, context):
     """Admin: reply to a backup .db file with /restore — replaces current DB."""
     if update.effective_user.id != ADMIN_ID:
@@ -4253,7 +3972,6 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_fallback_menu,  pattern=r"^fallback_menu$"))
     app.add_handler(CallbackQueryHandler(cb_buy_bundle,     pattern=r"^buy_bundle:"))
     app.add_handler(CallbackQueryHandler(cb_back_to_start,  pattern=r"^back_to_start$"))
-    app.add_handler(CallbackQueryHandler(cb_bundle_back_menu,  pattern=r"^bundle_back_menu$"))
     app.add_handler(CallbackQueryHandler(cb_buy,          pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(cb_upi_start,    pattern=r"^upi:start:"))
     app.add_handler(CallbackQueryHandler(cb_proof_choice, pattern=r"^proof:"))
@@ -4302,8 +4020,6 @@ def main():
     app.add_handler(CommandHandler("unpaid",      cmd_unpaid))
     app.add_handler(CommandHandler("backup",      cmd_backup))
     app.add_handler(CommandHandler("import_csv",  cmd_import_csv))
-    app.add_handler(CommandHandler("update_user", cmd_update_user))
-    app.add_handler(CommandHandler("export_csv",  cmd_export_csv))
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.ChatType.PRIVATE,
         on_csv_import_file
