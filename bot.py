@@ -4060,7 +4060,7 @@ async def cb_back_from_qr_bundle(update, context):
             pass
 
 async def cb_back_from_qr_channel(update, context):
-    """User tapped back from channel QR — return to main menu by editing caption."""
+    """User tapped back from channel QR — return to main menu (SAME LOGIC AS BUNDLE)."""
     q = update.callback_query
     await q.answer()
     user = q.from_user
@@ -4123,28 +4123,23 @@ async def cb_back_from_qr_channel(update, context):
             kb = InlineKeyboardMarkup(rows) if rows else None
     
     try:
-        # EDIT the photo CAPTION (not delete, just edit the caption like bundle back button)
-        await q.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        # Edit the current message (was QR, now shows menu) — SAME AS BUNDLE BACK BUTTON
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
-        log.debug(f"back_from_qr_channel edit caption failed: {e}")
-        # Fallback: try edit_message_text if caption edit fails
+        log.debug(f"back_from_qr_channel edit failed: {e}")
+        # Fallback: send new message if edit fails — SAME AS BUNDLE BACK BUTTON
         try:
-            await q.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        except Exception as e2:
-            log.debug(f"back_from_qr_channel edit text failed: {e2}")
-            # Last resort: send new message
-            try:
-                await context.bot.send_message(
-                    user.id, text, parse_mode=ParseMode.HTML, 
-                    reply_markup=kb, disable_notification=True
-                )
-            except:
-                pass
+            await context.bot.send_message(
+                user.id, text, parse_mode=ParseMode.HTML, 
+                reply_markup=kb, disable_notification=True
+            )
+        except:
+            pass
 
 
 
 async def cb_back_from_proof(update, context):
-    """User tapped back from proof screen — return to main menu WITHOUT deleting."""
+    """User tapped back from proof screen — return to main menu (SAME LOGIC AS BUNDLE)."""
     q = update.callback_query
     await q.answer()
     user = q.from_user
