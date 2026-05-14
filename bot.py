@@ -3948,6 +3948,70 @@ async def check_pending_reminders(context):
 async def on_error(update, context):
     log.error("Handler exception:", exc_info=context.error)
 
+async def cmd_update_user(update, context):
+    """Admin: Manually mark user as paid/approved - FIX for data restoration"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage: /update_user <user_id> <channel_id|0> <price> [status]\n\n"
+            "channel_id=0 for bundles, 1-10 for channels\n"
+            "Status: approved (default) | pending | rejected\n\n"
+            "Examples:\n"
+            "/update_user 123456789 0 99 approved   (Bundle ₹99)\n"
+            "/update_user 123456789 1 99 approved   (Channel 1)"
+        )
+        return
+    
+    try:
+        user_id = int(args[0])
+        channel_id = int(args[1])
+        price = int(args[2])
+        status = args[3].lower() if len(args) > 3 else "approved"
+    except ValueError:
+        await update.message.reply_text("❌ Invalid arguments (must be integers)")
+        return
+    
+    if status not in ["approved", "pending", "rejected"]:
+        await update.message.reply_text("❌ Status must be: approved, pending, or rejected")
+        return
+    
+    now = datetime.now(TZ).isoformat()
+    
+    try:
+        with db() as conn:
+            # Ensure user exists
+            upsert_user({"user_id": user_id})
+            
+            # Insert purchase
+            conn.execute(
+                """
+                INSERT INTO purchases 
+                (user_id, channel_id, channel_name, amount, status, created_at, approved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, channel_id, 
+                 f"Channel {channel_id}" if channel_id > 0 else f"Bundle ₹{price}",
+                 price, status, now, now if status == "approved" else None)
+            )
+        
+        # Notify user
+        if status == "approved":
+            try:
+                msg_text = "✅ <b>Admin has approved your access!</b>\n\nTap /start to see your channels."
+                await context.bot.send_message(user_id, msg_text, parse_mode=ParseMode.HTML, disable_notification=True)
+            except:
+                pass
+        
+        await update.message.reply_html(f"✅ Updated: User {user_id} → {status}")
+        log_user_message(user_id, "admin_update", f"Marked as {status}")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
         raise RuntimeError("Set BOT_TOKEN and ADMIN_ID env vars.")
@@ -3988,6 +4052,7 @@ def main():
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("update_user",   cmd_update_user))
     app.add_handler(CommandHandler("resetme", cmd_resetme))
     app.add_handler(CommandHandler("wipe",    cmd_wipe))
     app.add_handler(CommandHandler("whoami",    cmd_whoami))
