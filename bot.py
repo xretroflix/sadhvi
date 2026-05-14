@@ -1028,7 +1028,8 @@ async def cb_buy_bundle(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}"),
+        InlineKeyboardButton("⬅️ Back", callback_data="back_from_qr_bundle")
     ]])
     
     with open(qr_path, "rb") as fh:
@@ -1163,7 +1164,8 @@ async def cb_buy(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}"),
+        InlineKeyboardButton("⬅️ Back", callback_data="back_from_qr_channel")
     ]])
 
     with open(qr_path, "rb") as fh:
@@ -4012,6 +4014,62 @@ async def cmd_update_user(update, context):
         await update.message.reply_text(f"❌ Error: {e}")
 
 
+
+async def cb_back_from_qr_bundle(update, context):
+    """User tapped back from bundle QR — go back to fallback menu."""
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    
+    if is_blocked(user.id):
+        return
+    
+    # Delete the QR message
+    try:
+        await q.message.delete()
+    except:
+        pass
+    
+    # Go back to fallback menu
+    await cb_fallback_menu(update, context)
+
+async def cb_back_from_qr_channel(update, context):
+    """User tapped back from channel QR — return to main menu."""
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    
+    if is_blocked(user.id):
+        return
+    
+    # Delete the QR message
+    try:
+        await q.message.delete()
+    except:
+        pass
+    
+    # Return to main menu
+    await cmd_start(update, context)
+
+async def cb_back_from_proof(update, context):
+    """User tapped back from proof screen — return to main menu."""
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    
+    if is_blocked(user.id):
+        return
+    
+    # Delete the proof prompt message
+    try:
+        await q.message.delete()
+    except:
+        pass
+    
+    # Return to main menu
+    await cmd_start(update, context)
+
+
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
         raise RuntimeError("Set BOT_TOKEN and ADMIN_ID env vars.")
@@ -4038,6 +4096,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_back_to_start,  pattern=r"^back_to_start$"))
     app.add_handler(CallbackQueryHandler(cb_buy,          pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(cb_upi_start,    pattern=r"^upi:start:"))
+    app.add_handler(CallbackQueryHandler(cb_back_from_qr_bundle, pattern=r"^back_from_qr_bundle$"))
+    app.add_handler(CallbackQueryHandler(cb_back_from_qr_channel, pattern=r"^back_from_qr_channel$"))
+    app.add_handler(CallbackQueryHandler(cb_back_from_proof, pattern=r"^back_from_proof$"))
     app.add_handler(CallbackQueryHandler(cb_proof_choice, pattern=r"^proof:"))
     app.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
