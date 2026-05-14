@@ -4016,7 +4016,7 @@ async def cmd_update_user(update, context):
 
 
 async def cb_back_from_qr_bundle(update, context):
-    """User tapped back from bundle QR — go back to fallback menu."""
+    """User tapped back from bundle QR — return to fallback menu WITHOUT deleting."""
     q = update.callback_query
     await q.answer()
     user = q.from_user
@@ -4024,17 +4024,43 @@ async def cb_back_from_qr_bundle(update, context):
     if is_blocked(user.id):
         return
     
-    # Delete the QR message
-    try:
-        await q.message.delete()
-    except:
-        pass
+    # Edit the current message to show fallback menu (preserve chat flow)
+    bundles = [
+        ("1 Channel", 30),
+        ("5 Channels", 59),
+        ("10 Channels", 79),
+        ("15 Channels", 99),
+    ]
     
-    # Go back to fallback menu
-    await cb_fallback_menu(update, context)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
+        for name, price in bundles
+    ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
+    
+    text = (f"<b>💰 Budget Bundles</b>\n\n"
+            f"Get started with affordable options:\n\n"
+            f"• <b>1 Channel</b> — ₹30\n"
+            f"• <b>5 Channels</b> — ₹59\n"
+            f"• <b>10 Channels</b> — ₹79\n"
+            f"• <b>15 Channels</b> — ₹99\n\n"
+            f"<i>Tap any bundle to proceed with payment</i>")
+    
+    try:
+        # Edit the current message (was QR, now shows bundle menu)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        log.debug(f"back_from_qr_bundle edit failed: {e}")
+        # Fallback: send new message if edit fails
+        try:
+            await context.bot.send_message(
+                user.id, text, parse_mode=ParseMode.HTML, 
+                reply_markup=kb, disable_notification=True
+            )
+        except:
+            pass
 
 async def cb_back_from_qr_channel(update, context):
-    """User tapped back from channel QR — return to main menu."""
+    """User tapped back from channel QR — return to main menu WITHOUT deleting."""
     q = update.callback_query
     await q.answer()
     user = q.from_user
@@ -4042,17 +4068,74 @@ async def cb_back_from_qr_channel(update, context):
     if is_blocked(user.id):
         return
     
-    # Delete the QR message
-    try:
-        await q.message.delete()
-    except:
-        pass
+    # Get the main menu text and keyboard
+    if is_dnd(user.id):
+        text = "⏳ Admin is currently away. Message will be reviewed soon."
+        kb = None
+    else:
+        paid = has_paid_tier1(user.id)
+        owned_cids = set(get_owned_channel_ids(user.id))
+        owned_prices = set(get_owned_bundle_prices(user.id))
+        
+        if not paid:
+            text = (f"👋 <b>Welcome!</b>\n\n"
+                    f"Get started with <b>{CHANNELS[0]['name']}</b> for ₹{CHANNELS[0]['price']}\n\n"
+                    f"Or choose from budget bundles below.")
+            
+            rows = [[InlineKeyboardButton(f"⭐ {CHANNELS[0]['name']} — ₹{CHANNELS[0]['price']}", 
+                                         callback_data=f"buy:{CHANNELS[0]['id']}")]]
+            if is_fallback_enabled():
+                rows.append([InlineKeyboardButton("📦 Budget Bundles", callback_data="fallback_menu")])
+            kb = InlineKeyboardMarkup(rows)
+        else:
+            text = "<b>✅ Your Channels</b>\n\n"
+            rows = []
+            
+            # Show owned channels
+            for ch in CHANNELS:
+                if ch["id"] in owned_cids:
+                    rows.append([InlineKeyboardButton(f"✅ {ch['name']}", url=ch["link"])])
+            
+            # Show owned bundles
+            for price in sorted(owned_prices):
+                if price in BUNDLES:
+                    rows.append([InlineKeyboardButton(f"✅ {BUNDLES[price]['name']}", 
+                                                     url=BUNDLES[price]["link"])])
+            
+            # Show upgrades
+            for ch in CHANNELS:
+                if ch["id"] not in owned_cids:
+                    rows.append([InlineKeyboardButton(f"🔒 {ch['name']} — ₹{ch['price']}", 
+                                                     callback_data=f"buy:{ch['id']}")])
+            
+            # Show bundle upgrades
+            if owned_prices:
+                max_price = max(owned_prices)
+                for price in sorted(BUNDLES.keys()):
+                    if price > max_price:
+                        rows.append([InlineKeyboardButton(
+                            f"🔒 {BUNDLES[price]['name']} — ₹{price}",
+                            callback_data=f"buy_bundle:{price}"
+                        )])
+            
+            kb = InlineKeyboardMarkup(rows) if rows else None
     
-    # Return to main menu
-    await cmd_start(update, context)
+    try:
+        # Edit the current message (was QR, now shows main menu)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        log.debug(f"back_from_qr_channel edit failed: {e}")
+        # Fallback: send new message if edit fails
+        try:
+            await context.bot.send_message(
+                user.id, text, parse_mode=ParseMode.HTML, 
+                reply_markup=kb, disable_notification=True
+            )
+        except:
+            pass
 
 async def cb_back_from_proof(update, context):
-    """User tapped back from proof screen — return to main menu."""
+    """User tapped back from proof screen — return to main menu WITHOUT deleting."""
     q = update.callback_query
     await q.answer()
     user = q.from_user
@@ -4060,15 +4143,71 @@ async def cb_back_from_proof(update, context):
     if is_blocked(user.id):
         return
     
-    # Delete the proof prompt message
-    try:
-        await q.message.delete()
-    except:
-        pass
+    # Get the main menu text and keyboard (same as cb_back_from_qr_channel)
+    if is_dnd(user.id):
+        text = "⏳ Admin is currently away. Message will be reviewed soon."
+        kb = None
+    else:
+        paid = has_paid_tier1(user.id)
+        owned_cids = set(get_owned_channel_ids(user.id))
+        owned_prices = set(get_owned_bundle_prices(user.id))
+        
+        if not paid:
+            text = (f"👋 <b>Welcome!</b>\n\n"
+                    f"Get started with <b>{CHANNELS[0]['name']}</b> for ₹{CHANNELS[0]['price']}\n\n"
+                    f"Or choose from budget bundles below.")
+            
+            rows = [[InlineKeyboardButton(f"⭐ {CHANNELS[0]['name']} — ₹{CHANNELS[0]['price']}", 
+                                         callback_data=f"buy:{CHANNELS[0]['id']}")]]
+            if is_fallback_enabled():
+                rows.append([InlineKeyboardButton("📦 Budget Bundles", callback_data="fallback_menu")])
+            kb = InlineKeyboardMarkup(rows)
+        else:
+            text = "<b>✅ Your Channels</b>\n\n"
+            rows = []
+            
+            # Show owned channels
+            for ch in CHANNELS:
+                if ch["id"] in owned_cids:
+                    rows.append([InlineKeyboardButton(f"✅ {ch['name']}", url=ch["link"])])
+            
+            # Show owned bundles
+            for price in sorted(owned_prices):
+                if price in BUNDLES:
+                    rows.append([InlineKeyboardButton(f"✅ {BUNDLES[price]['name']}", 
+                                                     url=BUNDLES[price]["link"])])
+            
+            # Show upgrades
+            for ch in CHANNELS:
+                if ch["id"] not in owned_cids:
+                    rows.append([InlineKeyboardButton(f"🔒 {ch['name']} — ₹{ch['price']}", 
+                                                     callback_data=f"buy:{ch['id']}")])
+            
+            # Show bundle upgrades
+            if owned_prices:
+                max_price = max(owned_prices)
+                for price in sorted(BUNDLES.keys()):
+                    if price > max_price:
+                        rows.append([InlineKeyboardButton(
+                            f"🔒 {BUNDLES[price]['name']} — ₹{price}",
+                            callback_data=f"buy_bundle:{price}"
+                        )])
+            
+            kb = InlineKeyboardMarkup(rows) if rows else None
     
-    # Return to main menu
-    await cmd_start(update, context)
-
+    try:
+        # Edit the current message (was proof prompt, now shows main menu)
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        log.debug(f"back_from_proof edit failed: {e}")
+        # Fallback: send new message if edit fails
+        try:
+            await context.bot.send_message(
+                user.id, text, parse_mode=ParseMode.HTML, 
+                reply_markup=kb, disable_notification=True
+            )
+        except:
+            pass
 
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
