@@ -4060,7 +4060,7 @@ async def cb_back_from_qr_bundle(update, context):
             pass
 
 async def cb_back_from_qr_channel(update, context):
-    """User tapped back from channel QR — return to main menu WITHOUT deleting."""
+    """User tapped back from channel QR — return to main menu by editing caption."""
     q = update.callback_query
     await q.answer()
     user = q.from_user
@@ -4068,7 +4068,7 @@ async def cb_back_from_qr_channel(update, context):
     if is_blocked(user.id):
         return
     
-    # Get the main menu text and keyboard
+    # Get the main menu text and keyboard based on user state
     if is_dnd(user.id):
         text = "⏳ Admin is currently away. Message will be reviewed soon."
         kb = None
@@ -4078,6 +4078,7 @@ async def cb_back_from_qr_channel(update, context):
         owned_prices = set(get_owned_bundle_prices(user.id))
         
         if not paid:
+            # Unpaid user - show Tier 1 and bundles
             text = (f"👋 <b>Welcome!</b>\n\n"
                     f"Get started with <b>{CHANNELS[0]['name']}</b> for ₹{CHANNELS[0]['price']}\n\n"
                     f"Or choose from budget bundles below.")
@@ -4088,21 +4089,22 @@ async def cb_back_from_qr_channel(update, context):
                 rows.append([InlineKeyboardButton("📦 Budget Bundles", callback_data="fallback_menu")])
             kb = InlineKeyboardMarkup(rows)
         else:
+            # Paid user - show channels and upgrades
             text = "<b>✅ Your Channels</b>\n\n"
             rows = []
             
-            # Show owned channels
+            # Show owned channels with join links
             for ch in CHANNELS:
                 if ch["id"] in owned_cids:
                     rows.append([InlineKeyboardButton(f"✅ {ch['name']}", url=ch["link"])])
             
-            # Show owned bundles
+            # Show owned bundles with join links
             for price in sorted(owned_prices):
                 if price in BUNDLES:
                     rows.append([InlineKeyboardButton(f"✅ {BUNDLES[price]['name']}", 
                                                      url=BUNDLES[price]["link"])])
             
-            # Show upgrades
+            # Show locked channels as upgrades
             for ch in CHANNELS:
                 if ch["id"] not in owned_cids:
                     rows.append([InlineKeyboardButton(f"🔒 {ch['name']} — ₹{ch['price']}", 
@@ -4121,18 +4123,25 @@ async def cb_back_from_qr_channel(update, context):
             kb = InlineKeyboardMarkup(rows) if rows else None
     
     try:
-        # Edit the current message (was QR, now shows main menu)
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        # EDIT the photo CAPTION (not delete, just edit the caption like bundle back button)
+        await q.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
-        log.debug(f"back_from_qr_channel edit failed: {e}")
-        # Fallback: send new message if edit fails
+        log.debug(f"back_from_qr_channel edit caption failed: {e}")
+        # Fallback: try edit_message_text if caption edit fails
         try:
-            await context.bot.send_message(
-                user.id, text, parse_mode=ParseMode.HTML, 
-                reply_markup=kb, disable_notification=True
-            )
-        except:
-            pass
+            await q.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as e2:
+            log.debug(f"back_from_qr_channel edit text failed: {e2}")
+            # Last resort: send new message
+            try:
+                await context.bot.send_message(
+                    user.id, text, parse_mode=ParseMode.HTML, 
+                    reply_markup=kb, disable_notification=True
+                )
+            except:
+                pass
+
+
 
 async def cb_back_from_proof(update, context):
     """User tapped back from proof screen — return to main menu WITHOUT deleting."""
