@@ -49,6 +49,15 @@ ADMIN_ID  = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH   = os.getenv("DB_PATH", "master_database.db")
 TZ        = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))
 
+
+# Summary report timing
+SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "9"))
+SUMMARY_MINUTE = int(os.getenv("SUMMARY_MINUTE", "0"))
+
+# Pending reminder timing
+PENDING_REMINDER_HOURS = int(os.getenv("PENDING_REMINDER_HOURS", "24"))
+
+
 QR_FILES = [
     os.getenv("QR1_PATH", "qr1.jpg"),
     os.getenv("QR2_PATH", "qr2.jpg"),
