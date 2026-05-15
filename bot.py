@@ -29,6 +29,16 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters,
 )
 
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+log = logging.getLogger(__name__)
+
 # ==================================================================
 # CONFIG
 # ==================================================================
@@ -3680,6 +3690,14 @@ async def on_error(update, context):
     log.error("Handler exception:", exc_info=context.error)
 
 
+
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
 # ============================================================================
 # MESSAGE AUTO-CLEAR (5 minutes of user inactivity)
