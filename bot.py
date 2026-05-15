@@ -73,47 +73,10 @@ for i in range(1, 11):
         c["id"] = i
         CHANNELS.append(c)
 
-# BUNDLE CHANNELS — Each bundle has its own invite link
 # Format: "Bundle Name|Price|Invite Link"
 # Examples:
 #   BUNDLE_1="1 Channel|30|https://t.me/+BUNDLE1_HASH"
 #   BUNDLE_5="5 Channels|59|https://t.me/+BUNDLE5_HASH"
-def _parse_bundle(price: int, s: str):
-    if not s or "|" not in s:
-        return None
-    parts = [p.strip() for p in s.split("|")]
-    if len(parts) != 3:
-        return None
-    return {"name": parts[0], "price": int(parts[1]), "link": parts[2]}
-
-BUNDLES = {}  # {price: bundle_info}
-bundle_config = [
-    (30, "BUNDLE_1"),
-    (59, "BUNDLE_5"),
-    (79, "BUNDLE_10"),
-    (99, "BUNDLE_15"),
-]
-for price, env_key in bundle_config:
-    b = _parse_bundle(price, os.getenv(env_key, ""))
-    if b:
-        BUNDLES[price] = b
-
-# Support handle for help button (after approval / on issues)
-SUPPORT_HANDLE = os.getenv("SUPPORT_HANDLE", "@LinkbroSupport").lstrip("@")
-
-SUMMARY_HOUR   = int(os.getenv("SUMMARY_HOUR", "9"))
-SUMMARY_MINUTE = int(os.getenv("SUMMARY_MINUTE", "0"))
-PENDING_REMINDER_HOURS = int(os.getenv("PENDING_REMINDER_HOURS", "24"))
-
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("subbot")
-
-# ==================================================================
-# DATABASE
-# ==================================================================
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -236,15 +199,6 @@ def get_owned_channel_ids(user_id):
             "WHERE user_id=? AND status='approved'", (user_id,)
         ).fetchall()
     return {r["channel_id"] for r in rows}
-
-def get_owned_bundle_prices(user_id):
-    """Get set of bundle prices user owns (bundles have channel_id=0)."""
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT amount FROM purchases "
-            "WHERE user_id=? AND channel_id=0 AND status='approved'", (user_id,)
-        ).fetchall()
-    return {int(r["amount"]) for r in rows}
 
 def has_paid_tier1(user_id):
     if not CHANNELS:
@@ -399,7 +353,7 @@ def set_tracked_msgs(user_id, ids):
         conn.execute("UPDATE users SET tracked_msgs=? WHERE user_id=?",
                      (json.dumps(ids), user_id))
 
-def track_msg(user_id, msg_id):
+def track_msg(user_id, msg_id, context):
     ids = get_tracked_msgs(user_id)
     if msg_id not in ids:
         ids.append(msg_id)
@@ -445,13 +399,6 @@ def clear_dnd(user_id: int):
     with db() as conn:
         conn.execute("DELETE FROM dnd_users WHERE user_id=?", (user_id,))
     log.info(f"DND cleared for user {user_id}")
-
-def is_fallback_enabled() -> bool:
-    """Check if fallback bundles are enabled by admin."""
-    with db() as conn:
-        r = conn.execute("SELECT value FROM admin_settings WHERE key='fallback_enabled'",
-                        ).fetchone()
-    return r and r["value"].lower() == "true" if r else True  # Default: enabled
 
 def is_special_offers_enabled() -> bool:
     """Check if special offers/promotions are enabled by admin."""
@@ -687,7 +634,7 @@ async def expire_qr(context):
             parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
-        track_msg(user_id, m.message_id)
+        track_msg(user_id, m.message_id, context)
         # Auto-delete the expiry message itself after 30 seconds
         context.job_queue.run_once(
             auto_delete_message,
@@ -847,7 +794,7 @@ async def cmd_start(update, context):
             protect_content=True,
             disable_notification=True,
         )
-        track_msg(user.id, m.message_id)
+        track_msg(user.id, m.message_id, context)
         return
 
     rows = []
@@ -866,11 +813,6 @@ async def cmd_start(update, context):
         )])
         
         # 2. Add Fallback Bundle Offers (if admin enabled them)
-        if is_fallback_enabled():
-            rows.append([InlineKeyboardButton(
-                "📦 See Budget Bundles", callback_data="fallback_menu"
-            )])
-        
         intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
                  f"<b>Get started with {c['name']} at ₹{price}</b>")
 
@@ -935,7 +877,7 @@ async def cmd_start(update, context):
             protect_content=True,
             disable_notification=True,
         )
-        track_msg(user.id, m.message_id)
+        track_msg(user.id, m.message_id, context)
         # Save as menu message so future /start can edit it
         with db() as conn:
             conn.execute("UPDATE users SET menu_msg_id=? WHERE user_id=?",
@@ -947,127 +889,6 @@ async def cmd_start(update, context):
 # ==================================================================
 # USER: tap "See Fallback Offers" button
 # ==================================================================
-async def cb_fallback_menu(update, context):
-    """Show fallback bundle options for unpaid users."""
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
-    
-    if is_blocked(user.id):
-        return
-    
-    # Bundle options: (display_name, price_rupees)
-    bundles = [
-        ("1 Channel", 30),
-        ("5 Channels", 59),
-        ("10 Channels", 79),
-        ("15 Channels", 99),
-    ]
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
-        for name, price in bundles
-    ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
-    
-    text = (f"<b>💰 Budget Bundles</b>\n\n"
-            f"Get started with affordable options:\n\n"
-            f"• <b>1 Channel</b> — ₹30\n"
-            f"• <b>5 Channels</b> — ₹59\n"
-            f"• <b>10 Channels</b> — ₹79\n"
-            f"• <b>15 Channels</b> — ₹99\n\n"
-            f"<i>Tap any bundle to proceed with payment</i>")
-    
-    try:
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception as e:
-        log.debug(f"fallback menu edit failed: {e}")
-
-
-async def cb_buy_bundle(update, context):
-    """User selected a bundle. Show payment QR with "I've Paid" button."""
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
-    
-    if is_blocked(user.id):
-        return
-    
-    try:
-        bundle_price = int(q.data.split(":")[1])
-    except (ValueError, IndexError):
-        return
-    
-    # Pick QR code
-    qr_idx = pick_qr()
-    qr_path = QR_FILES[qr_idx]
-    
-    if not os.path.exists(qr_path):
-        await context.bot.send_message(
-            user.id,
-            "⚠️ QR code not available. Please contact admin.",
-            disable_notification=True,
-        )
-        return
-    
-    # Create purchase record for bundle
-    # Bundle: channel_id=0, name includes price, amount=bundle_price
-    bundle_channel = {"id": 0, "name": f"Bundle (₹{bundle_price})", "price": bundle_price}
-    pid = create_purchase(user.id, bundle_channel, qr_idx)
-    
-    # Delete the menu message (transitioning to QR flow)
-    try:
-        await q.message.delete()
-    except Exception:
-        pass
-    with db() as conn:
-        conn.execute("UPDATE users SET menu_msg_id=NULL WHERE user_id=?", (user.id,))
-    await clear_tracked(context, user.id)
-    
-    # Send QR with "I've Paid" button
-    caption = (
-        "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}"),
-        InlineKeyboardButton("⬅️ Back", callback_data="back_from_qr_bundle")
-    ]])
-    
-    with open(qr_path, "rb") as fh:
-        doc = await context.bot.send_photo(
-            chat_id=user.id, photo=fh,
-            caption=caption, parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-            disable_notification=True,
-        )
-    track_msg(user.id, doc.message_id)
-    update_purchase(pid, main_msg_id=doc.message_id,
-                    qr_downloaded_at=datetime.utcnow().isoformat())
-    
-    # Schedule QR expiry
-    if QR_EXPIRY_MINUTES > 0:
-        context.job_queue.run_once(
-            expire_qr,
-            when=timedelta(minutes=QR_EXPIRY_MINUTES),
-            data={"user_id": user.id, "purchase_id": pid,
-                  "qr_msg_id": doc.message_id},
-            name=f"qr_expire_{user.id}_{pid}",
-        )
-    
-    # Notify admin
-    u_row = get_user_row(user.id)
-    p_row = get_purchase(pid)
-    try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(f"📥 <b>QR Downloaded (Bundle)</b>\n\n{fmt_user_block(u_row, p_row)}\n\n"
-                  f"⏳ Awaiting payment proof…"),
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-        )
-    except Exception as e:
-        log.error(f"Admin notify failed: {e}")
-
-
-
 async def cb_back_to_start(update, context):
     """Go back to /start menu."""
     q = update.callback_query
@@ -1136,7 +957,7 @@ async def cb_buy(update, context):
             protect_content=True,
             disable_notification=True,
         )
-        track_msg(user.id, m.message_id)
+        track_msg(user.id, m.message_id, context)
         try:
             await context.bot.send_message(
                 ADMIN_ID, f"⚠️ QR missing at {qr_path}. User {user.id} blocked."
@@ -1164,8 +985,7 @@ async def cb_buy(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}"),
-        InlineKeyboardButton("⬅️ Back", callback_data="back_from_qr_channel")
+        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
     ]])
 
     with open(qr_path, "rb") as fh:
@@ -1175,7 +995,7 @@ async def cb_buy(update, context):
             reply_markup=kb,
             disable_notification=True,
         )
-    track_msg(user.id, doc.message_id)
+    track_msg(user.id, doc.message_id, context)
     update_purchase(pid, main_msg_id=doc.message_id,
                     qr_downloaded_at=datetime.utcnow().isoformat())
 
@@ -1277,7 +1097,7 @@ async def cb_upi_start(update, context):
         disable_notification=True,
     )
     update_purchase(pid, main_msg_id=m.message_id)
-    track_msg(user.id, m.message_id)
+    track_msg(user.id, m.message_id, context)
 
 
 async def cb_proof_choice(update, context):
@@ -1592,7 +1412,7 @@ async def cb_admin(update, context):
                     parse_mode=ParseMode.HTML, reply_markup=kb,
                     protect_content=True, disable_notification=True,
                 )
-                track_msg(user_id, m.message_id)
+                track_msg(user_id, m.message_id, context)
                 update_purchase(pid, main_msg_id=m.message_id)
                 delivered = True
             except Exception as e:
@@ -1648,45 +1468,6 @@ async def cb_admin(update, context):
                         f"⭐ {c['name']} — ₹{price}",
                         callback_data=f"buy:{c['id']}",
                     )])
-                    if is_fallback_enabled():
-                        rows.append([InlineKeyboardButton(
-                            "📦 See Budget Bundles", callback_data="fallback_menu"
-                        )])
-                    intro = (f"👋 <b>Hi there!</b>\n\n"
-                             f"<b>Get started with {c['name']} at ₹{price}</b>")
-                else:
-                    # User now has access — show updated menu with new purchase
-                    intro = f"👋 <b>Welcome back!</b>\n\n<b>You have access to your purchased content.</b>"
-                    
-                    # Show owned channels
-                    for c in CHANNELS:
-                        if c["id"] in owned_channel_ids:
-                            rows.append([InlineKeyboardButton(
-                                f"✅ {c['name']}", url=c["link"]
-                            )])
-                    
-                    # Show owned bundles
-                    for price in sorted(owned_bundle_prices):
-                        if price in BUNDLES:
-                            bundle = BUNDLES[price]
-                            rows.append([InlineKeyboardButton(
-                                f"✅ {bundle['name']}", url=bundle["link"]
-                            )])
-                    
-                    # Show upgrades
-                    for c in CHANNELS:
-                        if c["id"] not in owned_channel_ids:
-                            price = c["price"]
-                            rows.append([InlineKeyboardButton(
-                                f"🔒 {c['name']} — ₹{price}",
-                                callback_data=f"buy:{c['id']}",
-                            )])
-                
-                # Try to refresh the menu in-place (live update)
-                await edit_main(
-                    context, user_id, menu_row["menu_msg_id"],
-                    intro, reply_markup=InlineKeyboardMarkup(rows)
-                )
         except Exception as e:
             log.debug(f"Failed to refresh /start menu: {e}")
             # Silently ignore — if refresh fails, user can still tap /start manually
@@ -2285,58 +2066,6 @@ async def cmd_away(update, context):
         f"<i>Users will see this after submitting payment proof.</i>\n\n"
         f"To disable: <code>/away off</code>"
     )
-
-
-async def cmd_fallback_toggle(update, context):
-    """Admin: /fallback_toggle <on|off> — enable/disable fallback bundle offers
-    
-    When enabled: Unpaid users see "📦 See Fallback Offers" button
-    When disabled: Unpaid users see only primary offer (no fallback bundles)
-    
-    Examples:
-    /fallback_toggle on       → Enable fallback bundles
-    /fallback_toggle off      → Disable fallback bundles
-    /fallback_toggle status   → Check current status
-    
-    Use case: Run campaigns with fallback enabled, then disable temporarily
-    """
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args or []
-    if not args:
-        await update.message.reply_html(
-            "Usage: <code>/fallback_toggle &lt;on|off|status&gt;</code>\n\n"
-            "<code>/fallback_toggle on</code> — Enable fallback bundles\n"
-            "<code>/fallback_toggle off</code> — Disable fallback bundles\n"
-            "<code>/fallback_toggle status</code> — Check status"
-        )
-        return
-    
-    action = args[0].lower()
-    
-    if action == "status":
-        enabled = is_fallback_enabled()
-        status = "✅ ENABLED" if enabled else "🚫 DISABLED"
-        await update.message.reply_html(
-            f"<b>Fallback Bundles:</b> {status}\n\n"
-            f"<i>Unpaid users can see budget-friendly options: ₹30, ₹59, ₹79, ₹99</i>"
-        )
-        return
-    
-    if action not in ["on", "off"]:
-        await update.message.reply_text("Use: on, off, or status")
-        return
-    
-    enabled = action == "on"
-    set_admin_setting("fallback_enabled", "true" if enabled else "false")
-    
-    status = "✅ ENABLED" if enabled else "🚫 DISABLED"
-    msg = (
-        f"<b>Fallback Bundles:</b> {status}\n\n"
-        f"<i>Next /start by unpaid users will reflect this change.</i>"
-    )
-    await update.message.reply_html(msg)
 
 
 async def cmd_special_offers_toggle(update, context):
@@ -3950,268 +3679,37 @@ async def check_pending_reminders(context):
 async def on_error(update, context):
     log.error("Handler exception:", exc_info=context.error)
 
-async def cmd_update_user(update, context):
-    """Admin: Manually mark user as paid/approved - FIX for data restoration"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text(
-            "Usage: /update_user <user_id> <channel_id|0> <price> [status]\n\n"
-            "channel_id=0 for bundles, 1-10 for channels\n"
-            "Status: approved (default) | pending | rejected\n\n"
-            "Examples:\n"
-            "/update_user 123456789 0 99 approved   (Bundle ₹99)\n"
-            "/update_user 123456789 1 99 approved   (Channel 1)"
+
+
+# ============================================================================
+# MESSAGE AUTO-CLEAR (5 minutes of user inactivity)
+# ============================================================================
+
+import time
+
+async def auto_delete_message(context):
+    """Delete a message after 5 minutes if user hasn't interacted with it."""
+    job = context.job
+    chat_id, msg_id = job.data
+    try:
+        await context.bot.delete_message(chat_id, msg_id)
+        log.info(f"✓ Auto-cleared message {msg_id} from user {chat_id} after 5 minutes")
+    except Exception as e:
+        log.debug(f"Auto-clear skipped: {e}")
+
+def schedule_message_auto_delete(context, user_id, msg_id, seconds=300):
+    """Schedule a message for automatic deletion."""
+    try:
+        job_id = f"autodel_{user_id}_{msg_id}_{int(time.time()*1000)}"
+        context.job_queue.run_once(
+            auto_delete_message,
+            when=seconds,
+            data=(user_id, msg_id),
+            name=job_id
         )
-        return
-    
-    try:
-        user_id = int(args[0])
-        channel_id = int(args[1])
-        price = int(args[2])
-        status = args[3].lower() if len(args) > 3 else "approved"
-    except ValueError:
-        await update.message.reply_text("❌ Invalid arguments (must be integers)")
-        return
-    
-    if status not in ["approved", "pending", "rejected"]:
-        await update.message.reply_text("❌ Status must be: approved, pending, or rejected")
-        return
-    
-    now = datetime.now(TZ).isoformat()
-    
-    try:
-        with db() as conn:
-            # Ensure user exists
-            upsert_user({"user_id": user_id})
-            
-            # Insert purchase
-            conn.execute(
-                """
-                INSERT INTO purchases 
-                (user_id, channel_id, channel_name, amount, status, created_at, approved_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, channel_id, 
-                 f"Channel {channel_id}" if channel_id > 0 else f"Bundle ₹{price}",
-                 price, status, now, now if status == "approved" else None)
-            )
-        
-        # Notify user
-        if status == "approved":
-            try:
-                msg_text = "✅ <b>Admin has approved your access!</b>\n\nTap /start to see your channels."
-                await context.bot.send_message(user_id, msg_text, parse_mode=ParseMode.HTML, disable_notification=True)
-            except:
-                pass
-        
-        await update.message.reply_html(f"✅ Updated: User {user_id} → {status}")
-        log_user_message(user_id, "admin_update", f"Marked as {status}")
-        
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        log.debug(f"Failed to schedule auto-delete: {e}")
 
-
-
-async def cb_back_from_qr_bundle(update, context):
-    """User tapped back from bundle QR — return to fallback menu WITHOUT deleting."""
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
-    
-    if is_blocked(user.id):
-        return
-    
-    # Edit the current message to show fallback menu (preserve chat flow)
-    bundles = [
-        ("1 Channel", 30),
-        ("5 Channels", 59),
-        ("10 Channels", 79),
-        ("15 Channels", 99),
-    ]
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
-        for name, price in bundles
-    ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
-    
-    text = (f"<b>💰 Budget Bundles</b>\n\n"
-            f"Get started with affordable options:\n\n"
-            f"• <b>1 Channel</b> — ₹30\n"
-            f"• <b>5 Channels</b> — ₹59\n"
-            f"• <b>10 Channels</b> — ₹79\n"
-            f"• <b>15 Channels</b> — ₹99\n\n"
-            f"<i>Tap any bundle to proceed with payment</i>")
-    
-    try:
-        # Edit the current message (was QR, now shows bundle menu)
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception as e:
-        log.debug(f"back_from_qr_bundle edit failed: {e}")
-        # Fallback: send new message if edit fails
-        try:
-            await context.bot.send_message(
-                user.id, text, parse_mode=ParseMode.HTML, 
-                reply_markup=kb, disable_notification=True
-            )
-        except:
-            pass
-
-async def cb_back_from_qr_channel(update, context):
-    """User tapped back from channel QR — return to main menu (SAME LOGIC AS BUNDLE)."""
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
-    
-    if is_blocked(user.id):
-        return
-    
-    # Get the main menu text and keyboard based on user state
-    if is_dnd(user.id):
-        text = "⏳ Admin is currently away. Message will be reviewed soon."
-        kb = None
-    else:
-        paid = has_paid_tier1(user.id)
-        owned_cids = set(get_owned_channel_ids(user.id))
-        owned_prices = set(get_owned_bundle_prices(user.id))
-        
-        if not paid:
-            # Unpaid user - show Tier 1 and bundles
-            text = (f"👋 <b>Welcome!</b>\n\n"
-                    f"Get started with <b>{CHANNELS[0]['name']}</b> for ₹{CHANNELS[0]['price']}\n\n"
-                    f"Or choose from budget bundles below.")
-            
-            rows = [[InlineKeyboardButton(f"⭐ {CHANNELS[0]['name']} — ₹{CHANNELS[0]['price']}", 
-                                         callback_data=f"buy:{CHANNELS[0]['id']}")]]
-            if is_fallback_enabled():
-                rows.append([InlineKeyboardButton("📦 Budget Bundles", callback_data="fallback_menu")])
-            kb = InlineKeyboardMarkup(rows)
-        else:
-            # Paid user - show channels and upgrades
-            text = "<b>✅ Your Channels</b>\n\n"
-            rows = []
-            
-            # Show owned channels with join links
-            for ch in CHANNELS:
-                if ch["id"] in owned_cids:
-                    rows.append([InlineKeyboardButton(f"✅ {ch['name']}", url=ch["link"])])
-            
-            # Show owned bundles with join links
-            for price in sorted(owned_prices):
-                if price in BUNDLES:
-                    rows.append([InlineKeyboardButton(f"✅ {BUNDLES[price]['name']}", 
-                                                     url=BUNDLES[price]["link"])])
-            
-            # Show locked channels as upgrades
-            for ch in CHANNELS:
-                if ch["id"] not in owned_cids:
-                    rows.append([InlineKeyboardButton(f"🔒 {ch['name']} — ₹{ch['price']}", 
-                                                     callback_data=f"buy:{ch['id']}")])
-            
-            # Show bundle upgrades
-            if owned_prices:
-                max_price = max(owned_prices)
-                for price in sorted(BUNDLES.keys()):
-                    if price > max_price:
-                        rows.append([InlineKeyboardButton(
-                            f"🔒 {BUNDLES[price]['name']} — ₹{price}",
-                            callback_data=f"buy_bundle:{price}"
-                        )])
-            
-            kb = InlineKeyboardMarkup(rows) if rows else None
-    
-    try:
-        # Edit the current message (was QR, now shows menu) — SAME AS BUNDLE BACK BUTTON
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception as e:
-        log.debug(f"back_from_qr_channel edit failed: {e}")
-        # Fallback: send new message if edit fails — SAME AS BUNDLE BACK BUTTON
-        try:
-            await context.bot.send_message(
-                user.id, text, parse_mode=ParseMode.HTML, 
-                reply_markup=kb, disable_notification=True
-            )
-        except:
-            pass
-
-
-
-async def cb_back_from_proof(update, context):
-    """User tapped back from proof screen — return to main menu (SAME LOGIC AS BUNDLE)."""
-    q = update.callback_query
-    await q.answer()
-    user = q.from_user
-    
-    if is_blocked(user.id):
-        return
-    
-    # Get the main menu text and keyboard (same as cb_back_from_qr_channel)
-    if is_dnd(user.id):
-        text = "⏳ Admin is currently away. Message will be reviewed soon."
-        kb = None
-    else:
-        paid = has_paid_tier1(user.id)
-        owned_cids = set(get_owned_channel_ids(user.id))
-        owned_prices = set(get_owned_bundle_prices(user.id))
-        
-        if not paid:
-            text = (f"👋 <b>Welcome!</b>\n\n"
-                    f"Get started with <b>{CHANNELS[0]['name']}</b> for ₹{CHANNELS[0]['price']}\n\n"
-                    f"Or choose from budget bundles below.")
-            
-            rows = [[InlineKeyboardButton(f"⭐ {CHANNELS[0]['name']} — ₹{CHANNELS[0]['price']}", 
-                                         callback_data=f"buy:{CHANNELS[0]['id']}")]]
-            if is_fallback_enabled():
-                rows.append([InlineKeyboardButton("📦 Budget Bundles", callback_data="fallback_menu")])
-            kb = InlineKeyboardMarkup(rows)
-        else:
-            text = "<b>✅ Your Channels</b>\n\n"
-            rows = []
-            
-            # Show owned channels
-            for ch in CHANNELS:
-                if ch["id"] in owned_cids:
-                    rows.append([InlineKeyboardButton(f"✅ {ch['name']}", url=ch["link"])])
-            
-            # Show owned bundles
-            for price in sorted(owned_prices):
-                if price in BUNDLES:
-                    rows.append([InlineKeyboardButton(f"✅ {BUNDLES[price]['name']}", 
-                                                     url=BUNDLES[price]["link"])])
-            
-            # Show upgrades
-            for ch in CHANNELS:
-                if ch["id"] not in owned_cids:
-                    rows.append([InlineKeyboardButton(f"🔒 {ch['name']} — ₹{ch['price']}", 
-                                                     callback_data=f"buy:{ch['id']}")])
-            
-            # Show bundle upgrades
-            if owned_prices:
-                max_price = max(owned_prices)
-                for price in sorted(BUNDLES.keys()):
-                    if price > max_price:
-                        rows.append([InlineKeyboardButton(
-                            f"🔒 {BUNDLES[price]['name']} — ₹{price}",
-                            callback_data=f"buy_bundle:{price}"
-                        )])
-            
-            kb = InlineKeyboardMarkup(rows) if rows else None
-    
-    try:
-        # Edit the current message (was proof prompt, now shows main menu)
-        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception as e:
-        log.debug(f"back_from_proof edit failed: {e}")
-        # Fallback: send new message if edit fails
-        try:
-            await context.bot.send_message(
-                user.id, text, parse_mode=ParseMode.HTML, 
-                reply_markup=kb, disable_notification=True
-            )
-        except:
-            pass
 
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
@@ -4234,14 +3732,9 @@ def main():
 
     # User
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(cb_fallback_menu,  pattern=r"^fallback_menu$"))
-    app.add_handler(CallbackQueryHandler(cb_buy_bundle,     pattern=r"^buy_bundle:"))
     app.add_handler(CallbackQueryHandler(cb_back_to_start,  pattern=r"^back_to_start$"))
     app.add_handler(CallbackQueryHandler(cb_buy,          pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(cb_upi_start,    pattern=r"^upi:start:"))
-    app.add_handler(CallbackQueryHandler(cb_back_from_qr_bundle, pattern=r"^back_from_qr_bundle$"))
-    app.add_handler(CallbackQueryHandler(cb_back_from_qr_channel, pattern=r"^back_from_qr_channel$"))
-    app.add_handler(CallbackQueryHandler(cb_back_from_proof, pattern=r"^back_from_proof$"))
     app.add_handler(CallbackQueryHandler(cb_proof_choice, pattern=r"^proof:"))
     app.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
@@ -4256,7 +3749,6 @@ def main():
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(CommandHandler("update_user",   cmd_update_user))
     app.add_handler(CommandHandler("resetme", cmd_resetme))
     app.add_handler(CommandHandler("wipe",    cmd_wipe))
     app.add_handler(CommandHandler("whoami",    cmd_whoami))
@@ -4271,7 +3763,6 @@ def main():
     app.add_handler(CommandHandler("block",     cmd_block))
     app.add_handler(CommandHandler("unblock",     cmd_unblock))
     app.add_handler(CommandHandler("away",              cmd_away))
-    app.add_handler(CommandHandler("fallback_toggle",   cmd_fallback_toggle))
     app.add_handler(CommandHandler("special_offers_toggle", cmd_special_offers_toggle))
     app.add_handler(CommandHandler("show_channels",     cmd_show_channels))
     app.add_handler(CommandHandler("show_channels_status", cmd_show_channels_status))
