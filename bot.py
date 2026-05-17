@@ -1937,44 +1937,109 @@ async def cmd_find(update, context):
     await update.message.reply_html(text, disable_web_page_preview=True)
 
 
+
+
 async def cmd_help(update, context):
-    """Admin: /help — show all admin commands."""
+    """Comprehensive help showing all available commands."""
     if update.effective_user.id != ADMIN_ID:
         return
-    text = (
-        "🛠 <b>Admin Commands</b>\n\n"
+    
+    help_text = """<b>📚 COMPLETE COMMAND REFERENCE</b>
 
-        "<b>📊 Stats &amp; reports</b>\n"
-        "/stats — totals, revenue, status counts\n"
-        "/pending — users awaiting approval\n"
-        "/summary — yesterday's full summary + CSV\n"
-        "/listusers — last 30 users\n"
-        "/find &lt;text&gt; — search by name/username\n"
-        "/whoami [id] — DB state for one user\n\n"
+<b>═══════════════════════════════════════════════</b>
 
-        "<b>🧹 Cleanup (single user)</b>\n"
-        "/wipe &lt;id&gt; — clear chat, keep purchases\n"
-        "/reset &lt;id&gt; — full reset (delete purchases too)\n"
-        "/resetme — reset yourself (testing)\n\n"
+<b>📊 ANALYTICS & STATISTICS</b>
+/stats - View overall stats (users, revenue, payments)
+/segment_stats - Show all 9 user segments with counts
+/campaign_stats - View last 10 campaigns with results
+/data_summary - Quick stats + command guide
 
-        "<b>☢️ Cleanup (ALL users)</b>\n"
-        "/wipeall YES — clear ALL chats, keep purchases\n"
-        "/resetall DELETE-EVERYTHING — nuclear reset\n\n"
+<b>👥 USER MANAGEMENT</b>
+/users_list [segment] - View all users or by segment
+/user_profile <uid> - Show detailed user profile
+/user_notes <uid> [text] - Add/view user notes
+/filter_users <criteria> - Filter users (spent:X, segment:X, recent:X)
+/listusers - Complete user list
+/find <text> - Search users by name/ID
+/whoami [uid] - Get info about user
 
-        "<b>📢 Communication</b>\n"
-        "/broadcast &lt;msg&gt; — send to all users\n"
-        "/msg &lt;user_id&gt; [message] — send message to one user or open chat\n\n"
+<b>💰 PAYMENT MANAGEMENT</b>
+/pending - Show pending payments with approve/reject
+/unpaid - Show users who haven't paid
+/update_user <uid> <ch> <price> - Manually mark user as paid
+/reset <uid> - Complete user reset (DB + messages)
 
-        "<b>💾 DB backup</b>\n"
-        "/backup — get fresh DB file\n"
-        "/restore — reply to a .db file to restore\n"
-        "/import_csv — upload master_summary.csv to import purchase records\n\n"
+<b>📢 CAMPAIGN & PROMOTIONS</b>
+/send_offer <segment> <msg> - Send to unpaid/pending/purchased/vip
+/retarget <msg> - Send to purchased/VIP customers only
+/segment_target <seg> <msg> - Send to entire segment
+/broadcast <msg> - Send to all users
+/msg <uid> [text] - Send message to one user
+/offer_tier <tier> <msg> - Send offer to tier
+/offer_user <uid> <msg> - Send offer to one user
 
-        "<i>Inline buttons on admin notifications:</i>\n"
-        "✅ Approve · ❌ Reject · 📸 Request Screenshot\n"
-        "🧹 Wipe (after action) · 🚨 Open User Chat (after reject)"
-    )
-    await update.message.reply_html(text)
+<b>📋 CSV & BULK OPERATIONS</b>
+/export_master_csv - Download CSV with all users + segments
+/export_csv - Export purchases data
+/import_master_csv - Import CSV to bulk update
+/bulk_update_inactive <days> - Mark inactive users
+/bulk_update_browsing <days> - Mark browsing users
+/bulk_clear_overrides confirm - Clear all manual overrides
+
+<b>🛡️ USER CONTROL</b>
+/block <uid> - Block user from bot
+/unblock <uid> - Unblock user
+/away [msg] - Set away mode message
+/dnd_users - View do-not-disturb users
+
+<b>🎁 PROMOS & PRICING</b>
+/special_offers_toggle on|off - Enable/disable promotions
+/promo_set <id> <seg> <price> - Set promo price
+/promo_clear <id> <seg> - Clear promo
+/promo_status - View active promos
+/channel_price <id> <seg> <price> - Set custom price
+/show_channels <list> - Manage channel visibility
+
+<b>📤 DATA MANAGEMENT</b>
+/backup - Download database backup
+/restore - Restore from backup file
+/summary - Revenue summary
+/export_csv - Export purchases
+/import_csv - Import purchase data
+/logs <uid> - View user activity logs
+
+<b>🔧 UTILITIES</b>
+/bulk_ids <seg> - Get user IDs for segment
+/bulk_promo_users <seg> <price> - Send promo to segment
+/resetall - Reset all users (requires confirmation)
+/resetme - Reset your own account
+/wipe <uid> - Delete user's chat messages
+/wipeall - Delete all messages (all users)
+
+<b>ℹ️ SETTINGS</b>
+/fallback_toggle on|off - Toggle budget bundles
+/help - Show this command list
+
+<b>═══════════════════════════════════════════════</b>
+
+<b>SEGMENT TARGETING:</b>
+• unpaid - Never attempted purchase
+• bounce - Visited QR but quit
+• pending - Proof submitted, awaiting approval
+• purchased - 1 approved purchase
+• vip - 2+ approved purchases
+
+<b>FILTER EXAMPLES:</b>
+/filter_users segment:vip
+/filter_users spent:5000
+/filter_users recent:7
+/filter_users purchases:2
+
+<b>📞 SUPPORT:</b>
+For issues or questions, contact: """ + os.getenv("SUPPORT_HANDLE", "@support")
+
+    await update.message.reply_html(help_text)
+    log.info(f"Help command sent to admin {update.effective_user.id}")
 
 
 async def cmd_logs(update, context):
@@ -4579,6 +4644,349 @@ async def cmd_segment_target(update, context):
     log.info(f"Segment {segment}: {success} sent, {failed} failed")
 
 
+
+
+# ============================================================================
+# CSV IMPORT/EXPORT & BULK OPERATIONS
+# ============================================================================
+
+async def cmd_export_master_csv(update, context):
+    """Admin: Export complete user data as master_summary.csv with all segments."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    try:
+        with db() as conn:
+            users = conn.execute(
+                "SELECT user_id, username, first_name, last_name, created_at FROM users ORDER BY created_at DESC"
+            ).fetchall()
+        
+        # Build CSV with all user data and segments
+        csv_lines = []
+        csv_lines.append("user_id,username,name,segment,created_at,total_spent,purchases,status")
+        
+        for user in users:
+            user_id = user["user_id"]
+            segment = categorize_user(user_id)
+            
+            # Get purchase info
+            with db() as conn:
+                purchases = conn.execute(
+                    "SELECT amount, status FROM purchases WHERE user_id=? AND status='approved'",
+                    (user_id,)
+                ).fetchall()
+            
+            total_spent = sum(int(p["amount"]) or 0 for p in purchases)
+            purchase_count = len(purchases)
+            
+            name = (user["first_name"] or user["username"] or f"User{user_id}").replace(",", " ")
+            username = user["username"] or ""
+            
+            csv_lines.append(
+                f'{user_id},"{username}","{name}",{segment},{user["created_at"]},{total_spent},{purchase_count},{segment.upper()}'
+            )
+        
+        csv_content = "\n".join(csv_lines)
+        
+        # Save to file
+        with open("/tmp/master_summary.csv", "w") as f:
+            f.write(csv_content)
+        
+        # Send file
+        with open("/tmp/master_summary.csv", "rb") as f:
+            await context.bot.send_document(
+                chat_id=ADMIN_ID,
+                document=f,
+                filename="master_summary.csv",
+                caption=f"📊 Master Summary Export\n\nTotal Users: {len(users)}\nGenerated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        
+        log.info(f"Exported {len(users)} users to master_summary.csv")
+        
+    except Exception as e:
+        await update.message.reply_text(f"Export failed: {str(e)[:100]}")
+        log.error(f"CSV export error: {e}")
+
+async def cmd_import_master_csv(update, context):
+    """Admin: Import user data from master_summary.csv with bulk segment updates."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if not update.message.document:
+        await update.message.reply_text(
+            "Usage: Reply to this command with a CSV file\n\n"
+            "Expected columns:\n"
+            "  user_id, segment (or status)\n\n"
+            "This will UPDATE user segments in bulk.\n"
+            "Example: 123456789, inactive"
+        )
+        return
+    
+    try:
+        # Download file
+        file = await context.bot.get_file(update.message.document.file_id)
+        await file.download_to_drive("/tmp/upload.csv")
+        
+        # Parse CSV
+        import csv
+        updated = 0
+        skipped = 0
+        errors = []
+        
+        with open("/tmp/upload.csv", "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    user_id = int(row.get("user_id", "").strip())
+                    segment = row.get("segment") or row.get("status")
+                    
+                    if not segment:
+                        skipped += 1
+                        continue
+                    
+                    segment = segment.strip().lower()
+                    
+                    # Validate segment
+                    valid_segments = ["unpaid", "bounce", "pending", "purchased", "vip", "fraud", "dnd", "inactive"]
+                    if segment not in valid_segments:
+                        errors.append(f"Invalid segment for user {user_id}: {segment}")
+                        continue
+                    
+                    # Update user segment (store as note/override)
+                    with db() as conn:
+                        # Store override in user_logs
+                        conn.execute(
+                            "INSERT INTO user_logs (user_id, action, details, created_at) VALUES (?,?,?,?)",
+                            (user_id, 'segment_override', f'Set to: {segment}', datetime.utcnow().isoformat())
+                        )
+                    
+                    updated += 1
+                    
+                except ValueError as e:
+                    errors.append(f"Invalid user_id: {row.get('user_id')}")
+                except Exception as e:
+                    errors.append(f"Error processing row: {str(e)[:50]}")
+        
+        # Build response
+        text = f"<b>📥 CSV Import Complete</b>\n\n"
+        text += f"✅ Updated: {updated}\n"
+        text += f"⏭️ Skipped: {skipped}\n"
+        
+        if errors:
+            text += f"❌ Errors: {len(errors)}\n\n"
+            text += "First 5 errors:\n"
+            for error in errors[:5]:
+                text += f"  • {error}\n"
+        
+        await update.message.reply_html(text)
+        log.info(f"CSV import: {updated} updated, {skipped} skipped, {len(errors)} errors")
+        
+    except Exception as e:
+        await update.message.reply_text(f"Import failed: {str(e)[:100]}")
+        log.error(f"CSV import error: {e}")
+
+async def cmd_bulk_update_inactive(update, context):
+    """Admin: Mark users as inactive in bulk."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /bulk_update_inactive <days_since_activity>\n\n"
+            "Example: /bulk_update_inactive 30\n"
+            "→ Marks users with no activity in last 30 days as inactive\n\n"
+            "This logs the override for reference."
+        )
+        return
+    
+    try:
+        days = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid number of days")
+        return
+    
+    with db() as conn:
+        # Find users with no recent activity
+        cutoff_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        
+        users = conn.execute(
+            "SELECT user_id FROM users WHERE created_at < ?",
+            (cutoff_date,)
+        ).fetchall()
+        
+        updated = 0
+        for user in users:
+            # Check if user has any recent purchases
+            recent_purchases = conn.execute(
+                "SELECT COUNT(*) as count FROM purchases WHERE user_id=? AND created_at > ?",
+                (user["user_id"], cutoff_date)
+            ).fetchone()
+            
+            if recent_purchases["count"] == 0:
+                # Log as inactive override
+                conn.execute(
+                    "INSERT INTO user_logs (user_id, action, details, created_at) VALUES (?,?,?,?)",
+                    (user["user_id"], 'status_update', 'Marked as inactive (bulk)', datetime.utcnow().isoformat())
+                )
+                updated += 1
+    
+    await update.message.reply_html(
+        f"<b>✅ Bulk Update Complete</b>\n\n"
+        f"Marked {updated} users as inactive\n"
+        f"(No activity in {days} days)"
+    )
+    log.info(f"Bulk marked {updated} users as inactive")
+
+async def cmd_bulk_update_browsing(update, context):
+    """Admin: Mark users as browsing in bulk."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /bulk_update_browsing <days_since_join>\n\n"
+            "Example: /bulk_update_browsing 7\n"
+            "→ Marks users who joined 7+ days ago with no purchase as browsing\n\n"
+            "This logs the override for reference."
+        )
+        return
+    
+    try:
+        days = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid number of days")
+        return
+    
+    with db() as conn:
+        cutoff_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        
+        # Find users with no purchases
+        users = conn.execute(
+            "SELECT user_id FROM users WHERE created_at < ? AND user_id NOT IN (SELECT DISTINCT user_id FROM purchases)",
+            (cutoff_date,)
+        ).fetchall()
+        
+        updated = 0
+        for user in users:
+            # Log as browsing override
+            conn.execute(
+                "INSERT INTO user_logs (user_id, action, details, created_at) VALUES (?,?,?,?)",
+                (user["user_id"], 'status_update', f'Marked as browsing (bulk, {days}+ days)', datetime.utcnow().isoformat())
+            )
+            updated += 1
+    
+    await update.message.reply_html(
+        f"<b>✅ Bulk Update Complete</b>\n\n"
+        f"Marked {updated} users as browsing\n"
+        f"(Joined {days}+ days ago, no purchase)"
+    )
+    log.info(f"Bulk marked {updated} users as browsing")
+
+async def cmd_bulk_clear_overrides(update, context):
+    """Admin: Clear all status overrides and return to automatic categorization."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    args = context.args
+    if not args or args[0].lower() != "confirm":
+        await update.message.reply_text(
+            "⚠️ WARNING: This will clear all manual overrides\n\n"
+            "Users will return to automatic categorization.\n\n"
+            "Run: /bulk_clear_overrides confirm"
+        )
+        return
+    
+    with db() as conn:
+        # Delete all override logs
+        conn.execute(
+            "DELETE FROM user_logs WHERE action IN ('status_update', 'segment_override')"
+        )
+    
+    await update.message.reply_html(
+        "<b>✅ All Overrides Cleared</b>\n\n"
+        "Users now use automatic categorization."
+    )
+    log.info("Cleared all status overrides")
+
+async def cmd_user_notes(update, context):
+    """Admin: Add or view notes for a user."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /user_notes <user_id> [note text]\n\n"
+            "Add note: /user_notes 123456789 This user is a high-value customer\n"
+            "View notes: /user_notes 123456789"
+        )
+        return
+    
+    try:
+        user_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID")
+        return
+    
+    if len(args) > 1:
+        # Add note
+        note = " ".join(args[1:])
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO user_logs (user_id, action, details, created_at) VALUES (?,?,?,?)",
+                (user_id, 'note', note, datetime.utcnow().isoformat())
+            )
+        
+        await update.message.reply_text(f"✅ Note added for user {user_id}")
+    else:
+        # View notes
+        with db() as conn:
+            logs = conn.execute(
+                "SELECT details, created_at FROM user_logs WHERE user_id=? AND action='note' ORDER BY created_at DESC LIMIT 10",
+                (user_id,)
+            ).fetchall()
+        
+        if not logs:
+            await update.message.reply_text(f"No notes for user {user_id}")
+        else:
+            text = f"<b>📝 Notes for User {user_id}</b>\n\n"
+            for log in logs:
+                date = log["created_at"][:10]
+                text += f"{date}: {log['details']}\n"
+            
+            await update.message.reply_html(text)
+
+async def cmd_data_summary(update, context):
+    """Admin: Show complete data summary with CSV export options."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    with db() as conn:
+        stats = {
+            "total_users": conn.execute("SELECT COUNT(*) as count FROM users").fetchone()["count"],
+            "total_revenue": conn.execute("SELECT SUM(amount) as total FROM purchases WHERE status='approved'").fetchone()["total"] or 0,
+            "total_purchases": conn.execute("SELECT COUNT(*) as count FROM purchases WHERE status='approved'").fetchone()["count"],
+            "pending_payments": conn.execute("SELECT COUNT(*) as count FROM purchases WHERE status IN ('pending', 'verifying')").fetchone()["count"],
+        }
+    
+    text = "<b>📊 DATA SUMMARY</b>\n\n"
+    text += f"<b>Users:</b> {stats['total_users']}\n"
+    text += f"<b>Revenue:</b> ₹{stats['total_revenue']}\n"
+    text += f"<b>Approved Purchases:</b> {stats['total_purchases']}\n"
+    text += f"<b>Pending Payments:</b> {stats['pending_payments']}\n\n"
+    text += "<b>Export Options:</b>\n"
+    text += "• /export_master_csv - Full user data with segments\n"
+    text += "• /export_csv - Purchases data\n\n"
+    text += "<b>Bulk Operations:</b>\n"
+    text += "• /bulk_update_inactive <days>\n"
+    text += "• /bulk_update_browsing <days>\n"
+    text += "• /bulk_clear_overrides confirm"
+    
+    await update.message.reply_html(text)
+
+
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
         raise RuntimeError("Set BOT_TOKEN and ADMIN_ID env vars.")
@@ -4667,6 +5075,14 @@ def main():
     app.add_handler(CommandHandler("segment_stats", cmd_segment_stats))
     app.add_handler(CommandHandler("filter_users", cmd_filter_users))
     app.add_handler(CommandHandler("segment_target", cmd_segment_target))
+
+    app.add_handler(CommandHandler("export_master_csv", cmd_export_master_csv))
+    app.add_handler(CommandHandler("import_master_csv", cmd_import_master_csv))
+    app.add_handler(CommandHandler("bulk_update_inactive", cmd_bulk_update_inactive))
+    app.add_handler(CommandHandler("bulk_update_browsing", cmd_bulk_update_browsing))
+    app.add_handler(CommandHandler("bulk_clear_overrides", cmd_bulk_clear_overrides))
+    app.add_handler(CommandHandler("user_notes", cmd_user_notes))
+    app.add_handler(CommandHandler("data_summary", cmd_data_summary))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^adm:"))
 
     jq = app.job_queue
