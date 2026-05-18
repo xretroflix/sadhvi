@@ -1937,109 +1937,44 @@ async def cmd_find(update, context):
     await update.message.reply_html(text, disable_web_page_preview=True)
 
 
-
-
 async def cmd_help(update, context):
-    """Comprehensive help showing all available commands."""
+    """Admin: /help — show all admin commands."""
     if update.effective_user.id != ADMIN_ID:
         return
-    
-    help_text = """<b>📚 COMPLETE COMMAND REFERENCE</b>
+    text = (
+        "🛠 <b>Admin Commands</b>\n\n"
 
-<b>═══════════════════════════════════════════════</b>
+        "<b>📊 Stats &amp; reports</b>\n"
+        "/stats — totals, revenue, status counts\n"
+        "/pending — users awaiting approval\n"
+        "/summary — yesterday's full summary + CSV\n"
+        "/listusers — last 30 users\n"
+        "/find &lt;text&gt; — search by name/username\n"
+        "/whoami [id] — DB state for one user\n\n"
 
-<b>📊 ANALYTICS & STATISTICS</b>
-/stats - View overall stats (users, revenue, payments)
-/segment_stats - Show all 9 user segments with counts
-/campaign_stats - View last 10 campaigns with results
-/data_summary - Quick stats + command guide
+        "<b>🧹 Cleanup (single user)</b>\n"
+        "/wipe &lt;id&gt; — clear chat, keep purchases\n"
+        "/reset &lt;id&gt; — full reset (delete purchases too)\n"
+        "/resetme — reset yourself (testing)\n\n"
 
-<b>👥 USER MANAGEMENT</b>
-/users_list [segment] - View all users or by segment
-/user_profile <uid> - Show detailed user profile
-/user_notes <uid> [text] - Add/view user notes
-/filter_users <criteria> - Filter users (spent:X, segment:X, recent:X)
-/listusers - Complete user list
-/find <text> - Search users by name/ID
-/whoami [uid] - Get info about user
+        "<b>☢️ Cleanup (ALL users)</b>\n"
+        "/wipeall YES — clear ALL chats, keep purchases\n"
+        "/resetall DELETE-EVERYTHING — nuclear reset\n\n"
 
-<b>💰 PAYMENT MANAGEMENT</b>
-/pending - Show pending payments with approve/reject
-/unpaid - Show users who haven't paid
-/update_user <uid> <ch> <price> - Manually mark user as paid
-/reset <uid> - Complete user reset (DB + messages)
+        "<b>📢 Communication</b>\n"
+        "/broadcast &lt;msg&gt; — send to all users\n"
+        "/msg &lt;user_id&gt; [message] — send message to one user or open chat\n\n"
 
-<b>📢 CAMPAIGN & PROMOTIONS</b>
-/send_offer <segment> <msg> - Send to unpaid/pending/purchased/vip
-/retarget <msg> - Send to purchased/VIP customers only
-/segment_target <seg> <msg> - Send to entire segment
-/broadcast <msg> - Send to all users
-/msg <uid> [text] - Send message to one user
-/offer_tier <tier> <msg> - Send offer to tier
-/offer_user <uid> <msg> - Send offer to one user
+        "<b>💾 DB backup</b>\n"
+        "/backup — get fresh DB file\n"
+        "/restore — reply to a .db file to restore\n"
+        "/import_csv — upload master_summary.csv to import purchase records\n\n"
 
-<b>📋 CSV & BULK OPERATIONS</b>
-/export_master_csv - Download CSV with all users + segments
-/export_csv - Export purchases data
-/import_master_csv - Import CSV to bulk update
-/bulk_update_inactive <days> - Mark inactive users
-/bulk_update_browsing <days> - Mark browsing users
-/bulk_clear_overrides confirm - Clear all manual overrides
-
-<b>🛡️ USER CONTROL</b>
-/block <uid> - Block user from bot
-/unblock <uid> - Unblock user
-/away [msg] - Set away mode message
-/dnd_users - View do-not-disturb users
-
-<b>🎁 PROMOS & PRICING</b>
-/special_offers_toggle on|off - Enable/disable promotions
-/promo_set <id> <seg> <price> - Set promo price
-/promo_clear <id> <seg> - Clear promo
-/promo_status - View active promos
-/channel_price <id> <seg> <price> - Set custom price
-/show_channels <list> - Manage channel visibility
-
-<b>📤 DATA MANAGEMENT</b>
-/backup - Download database backup
-/restore - Restore from backup file
-/summary - Revenue summary
-/export_csv - Export purchases
-/import_csv - Import purchase data
-/logs <uid> - View user activity logs
-
-<b>🔧 UTILITIES</b>
-/bulk_ids <seg> - Get user IDs for segment
-/bulk_promo_users <seg> <price> - Send promo to segment
-/resetall - Reset all users (requires confirmation)
-/resetme - Reset your own account
-/wipe <uid> - Delete user's chat messages
-/wipeall - Delete all messages (all users)
-
-<b>ℹ️ SETTINGS</b>
-/fallback_toggle on|off - Toggle budget bundles
-/help - Show this command list
-
-<b>═══════════════════════════════════════════════</b>
-
-<b>SEGMENT TARGETING:</b>
-• unpaid - Never attempted purchase
-• bounce - Visited QR but quit
-• pending - Proof submitted, awaiting approval
-• purchased - 1 approved purchase
-• vip - 2+ approved purchases
-
-<b>FILTER EXAMPLES:</b>
-/filter_users segment:vip
-/filter_users spent:5000
-/filter_users recent:7
-/filter_users purchases:2
-
-<b>📞 SUPPORT:</b>
-For issues or questions, contact: """ + os.getenv("SUPPORT_HANDLE", "@support")
-
-    await update.message.reply_html(help_text)
-    log.info(f"Help command sent to admin {update.effective_user.id}")
+        "<i>Inline buttons on admin notifications:</i>\n"
+        "✅ Approve · ❌ Reject · 📸 Request Screenshot\n"
+        "🧹 Wipe (after action) · 🚨 Open User Chat (after reject)"
+    )
+    await update.message.reply_html(text)
 
 
 async def cmd_logs(update, context):
