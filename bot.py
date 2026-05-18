@@ -803,6 +803,75 @@ def admin_action_kb(pid):
 # ==================================================================
 # USER: /start
 # ==================================================================
+
+
+def build_multi_tier_keyboard():
+    """Build 3-column grid keyboard layout for tier offers."""
+    if not MULTI_TIER_ENABLED or not TIER_OFFERS:
+        return None  # Use default single-tier layout
+    
+    keyboard = []
+    tier_ids = sorted(TIER_OFFERS.keys())
+    combo_ids = sorted(COMBO_OFFERS.keys()) if COMBO_OFFERS else []
+    combo_placed = set()
+    
+    i = 0
+    while i < len(tier_ids):
+        row = []
+        
+        # Build 3-column row
+        for j in range(3):
+            if i + j < len(tier_ids):
+                tier_id = tier_ids[i + j]
+                tier_info = TIER_OFFERS[tier_id]
+                btn_text = f"{tier_info['emoji']}\n{tier_info['label']}\n₹{tier_info['price']}"
+                row.append(
+                    InlineKeyboardButton(
+                        btn_text,
+                        callback_data=f"buy_tier:{tier_id}"
+                    )
+                )
+        
+        if row:
+            keyboard.append(row)
+        
+        # Check if we should place a combo offer after this row
+        combo_index = (i // 3) + 1  # Which combo offer number (1, 2, 3...)
+        if combo_index in COMBO_OFFERS and combo_index not in combo_placed:
+            combo_info = COMBO_OFFERS[combo_index]
+            combo_text = f"{combo_info['emoji']} {combo_info['label']}\n₹{combo_info['price']}"
+            keyboard.append([
+                InlineKeyboardButton(
+                    combo_text,
+                    callback_data=f"buy_combo:{combo_index}"
+                )
+            ])
+            combo_placed.add(combo_index)
+        
+        i += 3
+    
+    # Add "See Bundle Offers" button at the end if bundles exist
+    if os.getenv("BUNDLE_1"):
+        keyboard.append([
+            InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")
+        ])
+    
+    # Add back button
+    keyboard.append([
+        InlineKeyboardButton("🔙 Back", callback_data="main_menu")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def build_single_tier_keyboard():
+    """Build default single-tier keyboard (₹99 entry point)."""
+    keyboard = [
+        [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99", callback_data="buy_tier:1")],
+        [InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def cmd_start(update, context):
     user = update.effective_user
     
@@ -3948,6 +4017,73 @@ async def check_pending_reminders(context):
 async def on_error(update, context):
     log.error("Handler exception:", exc_info=context.error)
 
+
+
+async def cmd_multi_tier_toggle(update, context):
+    """Admin: Enable/disable multi-tier entry point layout."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    args = context.args
+    if not args or args[0].lower() not in ["on", "off"]:
+        await update.message.reply_text(
+            "Usage: /multi_tier_toggle on|off\n\n"
+            "ON: Show 3-column tier grid layout\n"
+            "OFF: Show single ₹99 entry point (default)\n\n"
+            "Configure tiers via environment variables:\n"
+            "TIER_1=\"Label|99|emoji\"\n"
+            "TIER_2=\"Label|199|emoji\"\n"
+            "TIER_3=\"Label|299|emoji\"\n\n"
+            "Optional combo offers:\n"
+            "COMBO_1=\"Combo Label|199|emoji\""
+        )
+        return
+    
+    status = args[0].lower() == "on"
+    
+    await update.message.reply_html(
+        f"<b>{'✅ Multi-Tier Mode' if status else '❌ Single Tier Mode'}</b>\n\n"
+        f"Current: {status}\n\n"
+        f"You need to set MULTI_TIER_ENABLED in Railway Variables:\n"
+        f"<code>MULTI_TIER_ENABLED={str(status).lower()}</code>\n\n"
+        f"Then redeploy bot for changes to take effect."
+    )
+    log.info(f"Multi-tier toggle requested: {status}")
+
+async def cmd_configure_tiers(update, context):
+    """Admin: Show current tier and combo configuration."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    text = f"<b>📊 TIER CONFIGURATION</b>\n\n"
+    text += f"<b>Multi-Tier Status:</b> {'✅ ENABLED' if MULTI_TIER_ENABLED else '❌ DISABLED'}\n\n"
+    
+    if TIER_OFFERS:
+        text += f"<b>Tier Offers ({len(TIER_OFFERS)}):</b>\n"
+        for tier_id, tier_info in sorted(TIER_OFFERS.items()):
+            text += f"  {tier_info['emoji']} {tier_info['label']}: ₹{tier_info['price']}\n"
+    else:
+        text += "<b>Tier Offers:</b> None configured\n"
+    
+    if COMBO_OFFERS:
+        text += f"\n<b>Combo Offers ({len(COMBO_OFFERS)}):</b>\n"
+        for combo_id, combo_info in sorted(COMBO_OFFERS.items()):
+            text += f"  {combo_info['emoji']} {combo_info['label']}: ₹{combo_info['price']}\n"
+    else:
+        text += "\n<b>Combo Offers:</b> None configured\n"
+    
+    text += "\n<b>To configure, set in Railway Variables:</b>\n"
+    text += "<code>MULTI_TIER_ENABLED=true</code>\n"
+    text += "<code>TIER_1=Basic|99|💎</code>\n"
+    text += "<code>TIER_2=Premium|199|👑</code>\n"
+    text += "<code>TIER_3=Elite|299|⭐</code>\n"
+    text += "<code>COMBO_1=Bundle|249|🎁</code>\n"
+    text += "\nThen redeploy bot."
+    
+    await update.message.reply_html(text)
+
+
+
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
         raise RuntimeError("Set BOT_TOKEN and ADMIN_ID env vars.")
@@ -4025,6 +4161,9 @@ def main():
         on_csv_import_file
     ))
     app.add_handler(CommandHandler("restore",     cmd_restore))
+
+    app.add_handler(CommandHandler("multi_tier_toggle", cmd_multi_tier_toggle))
+    app.add_handler(CommandHandler("configure_tiers", cmd_configure_tiers))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^adm:"))
 
     jq = app.job_queue
