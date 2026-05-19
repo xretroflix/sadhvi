@@ -1110,8 +1110,8 @@ async def cb_fallback_menu(update, context):
     
     text = (f"<b>💰 100% TRUSTED</b>\n\n"
             f"Get started with affordable options:\n\n"
-            f"• <b>1 Channel</b> — ₹30\n"
-            f"<i>Tap any bundle to proceed with payment</i>")
+            f"• <b>1 Channel</b> — ₹9\n"
+            f"<i>Try and upgrade to ₹99 SOON!</i>")
     
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
