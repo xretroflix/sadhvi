@@ -29,16 +29,6 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters,
 )
 
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-log = logging.getLogger(__name__)
-
 # ==================================================================
 # CONFIG
 # ==================================================================
@@ -48,15 +38,6 @@ ADMIN_ID  = int(os.getenv("ADMIN_ID", "0"))
 # This allows database to be committed to git
 DB_PATH   = os.getenv("DB_PATH", "master_database.db")
 TZ        = ZoneInfo(os.getenv("TIMEZONE", "Asia/Kolkata"))
-
-
-# Summary report timing
-SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "9"))
-SUMMARY_MINUTE = int(os.getenv("SUMMARY_MINUTE", "0"))
-
-# Pending reminder timing
-PENDING_REMINDER_HOURS = int(os.getenv("PENDING_REMINDER_HOURS", "24"))
-
 
 QR_FILES = [
     os.getenv("QR1_PATH", "qr1.jpg"),
@@ -92,10 +73,47 @@ for i in range(1, 11):
         c["id"] = i
         CHANNELS.append(c)
 
+# BUNDLE CHANNELS — Each bundle has its own invite link
 # Format: "Bundle Name|Price|Invite Link"
 # Examples:
 #   BUNDLE_1="1 Channel|30|https://t.me/+BUNDLE1_HASH"
 #   BUNDLE_5="5 Channels|59|https://t.me/+BUNDLE5_HASH"
+def _parse_bundle(price: int, s: str):
+    if not s or "|" not in s:
+        return None
+    parts = [p.strip() for p in s.split("|")]
+    if len(parts) != 3:
+        return None
+    return {"name": parts[0], "price": int(parts[1]), "link": parts[2]}
+
+BUNDLES = {}  # {price: bundle_info}
+bundle_config = [
+    (30, "BUNDLE_1"),
+    (59, "BUNDLE_5"),
+    (79, "BUNDLE_10"),
+    (99, "BUNDLE_15"),
+]
+for price, env_key in bundle_config:
+    b = _parse_bundle(price, os.getenv(env_key, ""))
+    if b:
+        BUNDLES[price] = b
+
+# Support handle for help button (after approval / on issues)
+SUPPORT_HANDLE = os.getenv("SUPPORT_HANDLE", "@LinkbroSupport").lstrip("@")
+
+SUMMARY_HOUR   = int(os.getenv("SUMMARY_HOUR", "9"))
+SUMMARY_MINUTE = int(os.getenv("SUMMARY_MINUTE", "0"))
+PENDING_REMINDER_HOURS = int(os.getenv("PENDING_REMINDER_HOURS", "24"))
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("subbot")
+
+# ==================================================================
+# DATABASE
+# ==================================================================
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -113,34 +131,7 @@ def init_db():
                 menu_msg_id INTEGER,
                 created_at  TEXT DEFAULT CURRENT_TIMESTAMP
             );
-            
-            CREATE TABLE IF NOT EXISTS campaigns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                segment TEXT,
-                message TEXT,
-                sent_count INTEGER,
-                failed_count INTEGER,
-                created_at TEXT
-            );
-
-
-            CREATE TABLE IF NOT EXISTS user_segments (
-                user_id INTEGER PRIMARY KEY,
-                segment TEXT,  -- fraud, bounce, unpaid, pending, purchased
-                reason TEXT,   -- Why they're in this segment
-                created_at TEXT,
-                updated_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS qr_bounce_tracking (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                viewed_qr_at TEXT,
-                left_without_paying TEXT NULL,
-                created_at TEXT
-            );
-
-                        CREATE TABLE IF NOT EXISTS purchases (
+            CREATE TABLE IF NOT EXISTS purchases (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     INTEGER NOT NULL,
                 channel_id  INTEGER NOT NULL,
@@ -245,6 +236,15 @@ def get_owned_channel_ids(user_id):
             "WHERE user_id=? AND status='approved'", (user_id,)
         ).fetchall()
     return {r["channel_id"] for r in rows}
+
+def get_owned_bundle_prices(user_id):
+    """Get set of bundle prices user owns (bundles have channel_id=0)."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT amount FROM purchases "
+            "WHERE user_id=? AND channel_id=0 AND status='approved'", (user_id,)
+        ).fetchall()
+    return {int(r["amount"]) for r in rows}
 
 def has_paid_tier1(user_id):
     if not CHANNELS:
@@ -399,7 +399,7 @@ def set_tracked_msgs(user_id, ids):
         conn.execute("UPDATE users SET tracked_msgs=? WHERE user_id=?",
                      (json.dumps(ids), user_id))
 
-def track_msg(user_id, msg_id, context):
+def track_msg(user_id, msg_id):
     ids = get_tracked_msgs(user_id)
     if msg_id not in ids:
         ids.append(msg_id)
@@ -445,6 +445,13 @@ def clear_dnd(user_id: int):
     with db() as conn:
         conn.execute("DELETE FROM dnd_users WHERE user_id=?", (user_id,))
     log.info(f"DND cleared for user {user_id}")
+
+def is_fallback_enabled() -> bool:
+    """Check if fallback bundles are enabled by admin."""
+    with db() as conn:
+        r = conn.execute("SELECT value FROM admin_settings WHERE key='fallback_enabled'",
+                        ).fetchone()
+    return r and r["value"].lower() == "true" if r else True  # Default: enabled
 
 def is_special_offers_enabled() -> bool:
     """Check if special offers/promotions are enabled by admin."""
@@ -680,7 +687,7 @@ async def expire_qr(context):
             parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
-        track_msg(user_id, m.message_id, context)
+        track_msg(user_id, m.message_id)
         # Auto-delete the expiry message itself after 30 seconds
         context.job_queue.run_once(
             auto_delete_message,
@@ -796,6 +803,109 @@ def admin_action_kb(pid):
 # ==================================================================
 # USER: /start
 # ==================================================================
+
+# ============================================================================
+# MULTI-TIER ENTRY POINTS - 3x3 MATRIX LAYOUT
+# ============================================================================
+
+MULTI_TIER_ENABLED = os.getenv("MULTI_TIER_ENABLED", "false").lower() == "true"
+TIER_OFFERS = {}
+COMBO_OFFERS = {}
+
+# Parse tier offers from environment
+for i in range(1, 10):  # Support up to 9 tiers (3x3 matrix)
+    env_key = f"TIER_{i}"
+    tier_data = os.getenv(env_key)
+    if tier_data:
+        parts = tier_data.split("|")
+        if len(parts) >= 2:
+            TIER_OFFERS[i] = {
+                "label": parts[0].strip(),
+                "price": int(parts[1].strip()),
+                "emoji": parts[2].strip() if len(parts) > 2 else "💎"
+            }
+
+# Parse combo offers (can be placed at any position)
+for i in range(1, 4):  # Support up to 3 combo offers
+    env_key = f"COMBO_{i}"
+    combo_data = os.getenv(env_key)
+    if combo_data:
+        parts = combo_data.split("|")
+        if len(parts) >= 2:
+            # Auto-assign position: COMBO_1 after row 1, COMBO_2 after row 2, COMBO_3 after row 3
+            position = int(parts[3].strip()) if len(parts) > 3 else i
+            COMBO_OFFERS[i] = {
+                "label": parts[0].strip(),
+                "price": int(parts[1].strip()),
+                "emoji": parts[2].strip() if len(parts) > 2 else "🎁",
+                "position": position  # Position in grid (1=after row 1, 2=after row 2, etc.)
+            }
+
+def build_multi_tier_keyboard():
+    """Build 3×3 matrix keyboard with combo buttons between sections."""
+    if not MULTI_TIER_ENABLED or not TIER_OFFERS:
+        return None  # Use default single-tier layout
+    
+    keyboard = []
+    tier_ids = sorted(TIER_OFFERS.keys())
+    
+    # Build 3×3 matrix (3 tiers per row)
+    row_number = 0
+    for i in range(0, len(tier_ids), 3):
+        row_number += 1
+        row = []
+        
+        # Add up to 3 buttons per row
+        for j in range(3):
+            if i + j < len(tier_ids):
+                tier_id = tier_ids[i + j]
+                tier_info = TIER_OFFERS[tier_id]
+                btn_text = f"{tier_info['emoji']}\n{tier_info['label']}\n₹{tier_info['price']}"
+                row.append(
+                    InlineKeyboardButton(
+                        btn_text,
+                        callback_data=f"buy_tier:{tier_id}"
+                    )
+                )
+        
+        # Add this row to keyboard
+        if row:
+            keyboard.append(row)
+        
+        # Insert combo button after this row (if configured)
+        for combo_id in sorted(COMBO_OFFERS.keys()):
+            combo_info = COMBO_OFFERS[combo_id]
+            if combo_info.get("position") == row_number:
+                combo_text = f"{combo_info['emoji']} {combo_info['label']}\n₹{combo_info['price']}"
+                keyboard.append([
+                    InlineKeyboardButton(
+                        combo_text,
+                        callback_data=f"buy_combo:{combo_id}"
+                    )
+                ])
+    
+    # Add bundle offers button if configured
+    if os.getenv("BUNDLE_1"):
+        keyboard.append([
+            InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")
+        ])
+    
+    # Add back button
+    keyboard.append([
+        InlineKeyboardButton("🔙 Back", callback_data="main_menu")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def build_single_tier_keyboard():
+    """Build default single-tier keyboard (₹99 entry point)."""
+    keyboard = [
+        [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99", callback_data="buy_tier:1")],
+        [InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def cmd_start(update, context):
     user = update.effective_user
     
@@ -840,7 +950,7 @@ async def cmd_start(update, context):
             protect_content=True,
             disable_notification=True,
         )
-        track_msg(user.id, m.message_id, context)
+        track_msg(user.id, m.message_id)
         return
 
     rows = []
@@ -849,18 +959,62 @@ async def cmd_start(update, context):
         # ====== UNPAID USER FLOW ======
         # Show: Tier 1 (CORE) + Fallback Bundles (if enabled by admin)
         
-        # 1. Show Tier 1 only (mandatory entry) — use base price, consistent with upgrades
-        c = CHANNELS[0]
-        # Use default channel price (same as upgrade price for consistency)
-        price = c["price"]
-        rows.append([InlineKeyboardButton(
-            f"⭐ {c['name']} — ₹{price}",
-            callback_data=f"buy:{c['id']}",
-        )])
+        # 1. Show Multi-Tier Entry Points (if enabled) or Single Tier
+        if MULTI_TIER_ENABLED and TIER_OFFERS:
+            # ========== MULTI-TIER 3×3 MATRIX WITH COMBOS ==========
+            tier_ids = sorted(TIER_OFFERS.keys())
+            row_number = 0
+            
+            for i in range(0, len(tier_ids), 3):
+                row_number += 1
+                row = []
+                
+                # Add up to 3 tier buttons per row
+                for j in range(3):
+                    if i + j < len(tier_ids):
+                        tier_id = tier_ids[i + j]
+                        tier_info = TIER_OFFERS[tier_id]
+                        btn_text = f"{tier_info['emoji']}\n{tier_info['label']}\n₹{tier_info['price']}"
+                        row.append(
+                            InlineKeyboardButton(
+                                btn_text,
+                                callback_data=f"buy_tier:{tier_id}"
+                            )
+                        )
+                
+                if row:
+                    rows.append(row)
+                
+                # Insert combo button after this row (if configured for this position)
+                for combo_id in sorted(COMBO_OFFERS.keys()):
+                    combo_info = COMBO_OFFERS[combo_id]
+                    if combo_info.get("position") == row_number:
+                        combo_text = f"{combo_info['emoji']} {combo_info['label']}\n₹{combo_info['price']}"
+                        rows.append([
+                            InlineKeyboardButton(
+                                combo_text,
+                                callback_data=f"buy_combo:{combo_id}"
+                            )
+                        ])
+            
+            intro = f"👋 <b>Hi {user.first_name}!</b>\n\n<b>Choose Your Entry Point</b>\n\nSelect the tier that works best for you:"
         
-        # 2. Add Fallback Bundle Offers (if admin enabled them)
-        intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
-                 f"<b>Get started with {c['name']} at ₹{price}</b>")
+        else:
+            # ========== DEFAULT SINGLE-TIER MODE ==========
+            c = CHANNELS[0]
+            price = c["price"]
+            rows.append([InlineKeyboardButton(
+                f"⭐ Enjoy 15+ Channels — ₹{price}",
+                callback_data=f"buy:{c['id']}",
+            )])
+            intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
+                     f"<b>Get started with {c['name']} at ₹{price}</b>")
+        
+        # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
+        if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
+            rows.append([InlineKeyboardButton(
+                "📦 See Budget Bundles", callback_data="fallback_menu"
+            )])
 
     else:
         # ====== TIER 1+ OWNER FLOW ======
@@ -923,7 +1077,7 @@ async def cmd_start(update, context):
             protect_content=True,
             disable_notification=True,
         )
-        track_msg(user.id, m.message_id, context)
+        track_msg(user.id, m.message_id)
         # Save as menu message so future /start can edit it
         with db() as conn:
             conn.execute("UPDATE users SET menu_msg_id=? WHERE user_id=?",
@@ -935,6 +1089,126 @@ async def cmd_start(update, context):
 # ==================================================================
 # USER: tap "See Fallback Offers" button
 # ==================================================================
+async def cb_fallback_menu(update, context):
+    """Show fallback bundle options for unpaid users."""
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    
+    if is_blocked(user.id):
+        return
+    
+    # Bundle options: (display_name, price_rupees)
+    bundles = [
+        ("1 Channel", 30),
+        ("5 Channels", 59),
+        ("10 Channels", 79),
+        ("15 Channels", 99),
+    ]
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
+        for name, price in bundles
+    ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
+    
+    text = (f"<b>💰 Budget Bundles</b>\n\n"
+            f"Get started with affordable options:\n\n"
+            f"• <b>1 Channel</b> — ₹30\n"
+            f"• <b>5 Channels</b> — ₹59\n"
+            f"• <b>10 Channels</b> — ₹79\n"
+            f"• <b>15 Channels</b> — ₹99\n\n"
+            f"<i>Tap any bundle to proceed with payment</i>")
+    
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        log.debug(f"fallback menu edit failed: {e}")
+
+
+async def cb_buy_bundle(update, context):
+    """User selected a bundle. Show payment QR with "I've Paid" button."""
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    
+    if is_blocked(user.id):
+        return
+    
+    try:
+        bundle_price = int(q.data.split(":")[1])
+    except (ValueError, IndexError):
+        return
+    
+    # Pick QR code
+    qr_idx = pick_qr()
+    qr_path = QR_FILES[qr_idx]
+    
+    if not os.path.exists(qr_path):
+        await context.bot.send_message(
+            user.id,
+            "⚠️ QR code not available. Please contact admin.",
+            disable_notification=True,
+        )
+        return
+    
+    # Create purchase record for bundle
+    # Bundle: channel_id=0, name includes price, amount=bundle_price
+    bundle_channel = {"id": 0, "name": f"Bundle (₹{bundle_price})", "price": bundle_price}
+    pid = create_purchase(user.id, bundle_channel, qr_idx)
+    
+    # Delete the menu message (transitioning to QR flow)
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    with db() as conn:
+        conn.execute("UPDATE users SET menu_msg_id=NULL WHERE user_id=?", (user.id,))
+    await clear_tracked(context, user.id)
+    
+    # Send QR with "I've Paid" button
+    caption = (
+        "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+    ]])
+    
+    with open(qr_path, "rb") as fh:
+        doc = await context.bot.send_photo(
+            chat_id=user.id, photo=fh,
+            caption=caption, parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_notification=True,
+        )
+    track_msg(user.id, doc.message_id)
+    update_purchase(pid, main_msg_id=doc.message_id,
+                    qr_downloaded_at=datetime.utcnow().isoformat())
+    
+    # Schedule QR expiry
+    if QR_EXPIRY_MINUTES > 0:
+        context.job_queue.run_once(
+            expire_qr,
+            when=timedelta(minutes=QR_EXPIRY_MINUTES),
+            data={"user_id": user.id, "purchase_id": pid,
+                  "qr_msg_id": doc.message_id},
+            name=f"qr_expire_{user.id}_{pid}",
+        )
+    
+    # Notify admin
+    u_row = get_user_row(user.id)
+    p_row = get_purchase(pid)
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(f"📥 <b>QR Downloaded (Bundle)</b>\n\n{fmt_user_block(u_row, p_row)}\n\n"
+                  f"⏳ Awaiting payment proof…"),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.error(f"Admin notify failed: {e}")
+
+
+
 async def cb_back_to_start(update, context):
     """Go back to /start menu."""
     q = update.callback_query
@@ -1003,7 +1277,7 @@ async def cb_buy(update, context):
             protect_content=True,
             disable_notification=True,
         )
-        track_msg(user.id, m.message_id, context)
+        track_msg(user.id, m.message_id)
         try:
             await context.bot.send_message(
                 ADMIN_ID, f"⚠️ QR missing at {qr_path}. User {user.id} blocked."
@@ -1041,7 +1315,7 @@ async def cb_buy(update, context):
             reply_markup=kb,
             disable_notification=True,
         )
-    track_msg(user.id, doc.message_id, context)
+    track_msg(user.id, doc.message_id)
     update_purchase(pid, main_msg_id=doc.message_id,
                     qr_downloaded_at=datetime.utcnow().isoformat())
 
@@ -1143,7 +1417,7 @@ async def cb_upi_start(update, context):
         disable_notification=True,
     )
     update_purchase(pid, main_msg_id=m.message_id)
-    track_msg(user.id, m.message_id, context)
+    track_msg(user.id, m.message_id)
 
 
 async def cb_proof_choice(update, context):
@@ -1458,7 +1732,7 @@ async def cb_admin(update, context):
                     parse_mode=ParseMode.HTML, reply_markup=kb,
                     protect_content=True, disable_notification=True,
                 )
-                track_msg(user_id, m.message_id, context)
+                track_msg(user_id, m.message_id)
                 update_purchase(pid, main_msg_id=m.message_id)
                 delivered = True
             except Exception as e:
@@ -1492,6 +1766,13 @@ async def cb_admin(update, context):
                         (user_id,)).fetchall()
                 
                 owned_channel_ids = {row["channel_id"] for row in owned_purchases if row["channel_id"] != 0}
+                owned_bundle_prices = set()
+                for row in owned_purchases:
+                    if row["channel_id"] == 0 and row["amount"]:
+                        try:
+                            owned_bundle_prices.add(int(row["amount"]))
+                        except (ValueError, TypeError):
+                            pass
                 
                 if not CHANNELS:
                     return
@@ -1499,43 +1780,53 @@ async def cb_admin(update, context):
                 paid_t1 = CHANNELS[0]["id"] in owned_channel_ids if CHANNELS else False
                 rows = []
                 
-                # Build updated menu
-                if paid_t1:
-                    # PAID USER: Show owned + unlocked channels
+                if not paid_t1:
+                    # User still unpaid (shouldn't happen but handle it)
+                    c = CHANNELS[0]
+                    price = c["price"]
+                    rows.append([InlineKeyboardButton(
+                        f"⭐ {c['name']} — ₹{price}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                    if is_fallback_enabled():
+                        rows.append([InlineKeyboardButton(
+                            "📦 See Budget Bundles", callback_data="fallback_menu"
+                        )])
+                    intro = (f"👋 <b>Hi there!</b>\n\n"
+                             f"<b>Get started with {c['name']} at ₹{price}</b>")
+                else:
+                    # User now has access — show updated menu with new purchase
+                    intro = f"👋 <b>Welcome back!</b>\n\n<b>You have access to your purchased content.</b>"
+                    
+                    # Show owned channels
                     for c in CHANNELS:
                         if c["id"] in owned_channel_ids:
                             rows.append([InlineKeyboardButton(
-                                f"✅ {c['name']} — Join", url=c["link"]
+                                f"✅ {c['name']}", url=c["link"]
                             )])
+                    
+                    # Show owned bundles
+                    for price in sorted(owned_bundle_prices):
+                        if price in BUNDLES:
+                            bundle = BUNDLES[price]
+                            rows.append([InlineKeyboardButton(
+                                f"✅ {bundle['name']}", url=bundle["link"]
+                            )])
+                    
+                    # Show upgrades
                     for c in CHANNELS:
                         if c["id"] not in owned_channel_ids:
+                            price = c["price"]
                             rows.append([InlineKeyboardButton(
-                                f"🔒 {c['name']} — ₹{c['price']}",
-                                callback_data=f"buy:{c['id']}"
+                                f"🔒 {c['name']} — ₹{price}",
+                                callback_data=f"buy:{c['id']}",
                             )])
-                else:
-                    # UNPAID: Show entry option only
-                    c = CHANNELS[0]
-                    rows.append([InlineKeyboardButton(
-                        f"⭐ {c['name']} — ₹{c['price']}",
-                        callback_data=f"buy:{c['id']}"
-                    )])
                 
-                # Update the menu message with new state
-                if rows:
-                    menu_text = "<b>✅ Your Channels</b>" if paid_t1 else f"👋 <b>Welcome!</b>\n\nGet started with <b>{CHANNELS[0]['name']}</b>"
-                    kb = InlineKeyboardMarkup(rows)
-                    try:
-                        await context.bot.edit_message_text(
-                            chat_id=user_id,
-                            message_id=menu_row["menu_msg_id"],
-                            text=menu_text,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=kb
-                        )
-                        log.info(f"✅ Live menu updated for user {user_id} after approval")
-                    except Exception as e:
-                        log.debug(f"Menu update failed: {e}")
+                # Try to refresh the menu in-place (live update)
+                await edit_main(
+                    context, user_id, menu_row["menu_msg_id"],
+                    intro, reply_markup=InlineKeyboardMarkup(rows)
+                )
         except Exception as e:
             log.debug(f"Failed to refresh /start menu: {e}")
             # Silently ignore — if refresh fails, user can still tap /start manually
@@ -2134,6 +2425,58 @@ async def cmd_away(update, context):
         f"<i>Users will see this after submitting payment proof.</i>\n\n"
         f"To disable: <code>/away off</code>"
     )
+
+
+async def cmd_fallback_toggle(update, context):
+    """Admin: /fallback_toggle <on|off> — enable/disable fallback bundle offers
+    
+    When enabled: Unpaid users see "📦 See Fallback Offers" button
+    When disabled: Unpaid users see only primary offer (no fallback bundles)
+    
+    Examples:
+    /fallback_toggle on       → Enable fallback bundles
+    /fallback_toggle off      → Disable fallback bundles
+    /fallback_toggle status   → Check current status
+    
+    Use case: Run campaigns with fallback enabled, then disable temporarily
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/fallback_toggle &lt;on|off|status&gt;</code>\n\n"
+            "<code>/fallback_toggle on</code> — Enable fallback bundles\n"
+            "<code>/fallback_toggle off</code> — Disable fallback bundles\n"
+            "<code>/fallback_toggle status</code> — Check status"
+        )
+        return
+    
+    action = args[0].lower()
+    
+    if action == "status":
+        enabled = is_fallback_enabled()
+        status = "✅ ENABLED" if enabled else "🚫 DISABLED"
+        await update.message.reply_html(
+            f"<b>Fallback Bundles:</b> {status}\n\n"
+            f"<i>Unpaid users can see budget-friendly options: ₹30, ₹59, ₹79, ₹99</i>"
+        )
+        return
+    
+    if action not in ["on", "off"]:
+        await update.message.reply_text("Use: on, off, or status")
+        return
+    
+    enabled = action == "on"
+    set_admin_setting("fallback_enabled", "true" if enabled else "false")
+    
+    status = "✅ ENABLED" if enabled else "🚫 DISABLED"
+    msg = (
+        f"<b>Fallback Bundles:</b> {status}\n\n"
+        f"<i>Next /start by unpaid users will reflect this change.</i>"
+    )
+    await update.message.reply_html(msg)
 
 
 async def cmd_special_offers_toggle(update, context):
@@ -3747,838 +4090,6 @@ async def check_pending_reminders(context):
 async def on_error(update, context):
     log.error("Handler exception:", exc_info=context.error)
 
-
-
-
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-
-# ============================================================================
-# MESSAGE AUTO-CLEAR (5 minutes of user inactivity)
-# ============================================================================
-
-import time
-
-async def auto_delete_message(context):
-    """Delete a message after 5 minutes if user hasn't interacted with it."""
-    job = context.job
-    chat_id, msg_id = job.data
-    try:
-        await context.bot.delete_message(chat_id, msg_id)
-        log.info(f"✓ Auto-cleared message {msg_id} from user {chat_id} after 5 minutes")
-    except Exception as e:
-        log.debug(f"Auto-clear skipped: {e}")
-
-def schedule_message_auto_delete(context, user_id, msg_id, seconds=300):
-    """Schedule a message for automatic deletion."""
-    try:
-        job_id = f"autodel_{user_id}_{msg_id}_{int(time.time()*1000)}"
-        context.job_queue.run_once(
-            auto_delete_message,
-            when=seconds,
-            data=(user_id, msg_id),
-            name=job_id
-        )
-    except Exception as e:
-        log.debug(f"Failed to schedule auto-delete: {e}")
-
-
-
-
-# ============================================================================
-# PROMOTIONAL & OFFER MESSAGING
-# ============================================================================
-
-async def cmd_send_offer(update, context):
-    """Admin: Send promotional offer to specific users or segments."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: /send_offer <segment> <message>\n\n"
-            "Available Segments:\n"
-            "  unpaid     → Never attempted purchase\n"
-            "  bounce     → Visited QR but never submitted proof\n"
-            "  pending    → Submitted proof, awaiting approval\n"
-            "  purchased  → Has 1 approved purchase\n"
-            "  vip        → Has 2+ approved purchases\n"
-            "  <user_id>  → Send to specific user\n\n"
-            "⚠️ DO NOT USE: fraud, blocked, dnd\n\n"
-            "Example:\n"
-            "/send_offer unpaid 🎉 Special offer! Premium access for ₹299 today only!"
-        )
-        return
-    
-    segment = args[0].lower()
-    message = " ".join(args[1:])
-    
-    # Get target users based on segment
-    target_users = []
-    
-    with db() as conn:
-        if segment == "unpaid":
-            # Users marked as unpaid (exclude fraud and bounce)
-            rows = conn.execute(
-                "SELECT user_id FROM user_segments WHERE segment='unpaid'"
-            ).fetchall()
-            target_users = [row["user_id"] for row in rows]
-        
-        elif segment == "pending":
-            # Users with pending/verifying purchases
-            rows = conn.execute(
-                "SELECT DISTINCT user_id FROM purchases WHERE status IN ('pending', 'verifying')"
-            ).fetchall()
-            target_users = [row["user_id"] for row in rows]
-        
-        elif segment == "purchased":
-            # Users with approved purchases
-            rows = conn.execute(
-                "SELECT DISTINCT user_id FROM purchases WHERE status='approved'"
-            ).fetchall()
-            target_users = [row["user_id"] for row in rows]
-        
-        elif segment.isdigit():
-            # Specific user
-            target_users = [int(segment)]
-        
-        else:
-            await update.message.reply_text(f"Unknown segment: {segment}")
-            return
-    
-    # Send to all target users
-    success = 0
-    failed = 0
-    
-    for user_id in target_users:
-        try:
-            await context.bot.send_message(
-                user_id,
-                message,
-                parse_mode=ParseMode.HTML,
-                disable_notification=False
-            )
-            success += 1
-        except Exception as e:
-            failed += 1
-            log.debug(f"Failed to send to {user_id}: {e}")
-    
-    # Log campaign
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO campaigns (segment, message, sent_count, failed_count, created_at) VALUES (?,?,?,?,?)",
-            (segment, message, success, failed, datetime.utcnow().isoformat())
-        )
-    
-    await update.message.reply_html(
-        f"<b>✅ Campaign Sent</b>\n\n"
-        f"Segment: <b>{segment}</b>\n"
-        f"Sent: <b>{success}</b>\n"
-        f"Failed: <b>{failed}</b>\n"
-        f"Total: <b>{success + failed}</b>"
-    )
-    log.info(f"Campaign to {segment}: {success} sent, {failed} failed")
-
-async def cmd_retarget(update, context):
-    """Admin: Send retargeting offer to users who purchased before."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Usage: /retarget <message>\n\n"
-            "Targets users with previous approved purchases for upsells/renewals.\n\n"
-            "Example:\n"
-            "/retarget 🎁 New Premium Channel added! Upgrade now for ₹499"
-        )
-        return
-    
-    message = " ".join(args)
-    
-    # Get only PURCHASED users (exclude fraud, bounce, unpaid, pending)
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT user_id FROM user_segments WHERE segment='purchased'"
-        ).fetchall()
-        target_users = [row["user_id"] for row in rows]
-    
-    # Send retargeting message
-    success = 0
-    failed = 0
-    
-    for user_id in target_users:
-        try:
-            await context.bot.send_message(
-                user_id,
-                f"<b>🎯 Exclusive Offer for You</b>\n\n{message}",
-                parse_mode=ParseMode.HTML,
-                disable_notification=False
-            )
-            success += 1
-        except Exception as e:
-            failed += 1
-            log.debug(f"Retarget failed for {user_id}: {e}")
-    
-    await update.message.reply_html(
-        f"<b>✅ Retargeting Campaign Sent</b>\n\n"
-        f"Previous Customers: <b>{success}</b>\n"
-        f"Failed: <b>{failed}</b>\n"
-        f"Total Reached: <b>{success + failed}</b>"
-    )
-    log.info(f"Retargeting: {success} sent, {failed} failed")
-
-async def cmd_campaign_stats(update, context):
-    """Admin: View campaign statistics."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    with db() as conn:
-        campaigns = conn.execute(
-            "SELECT segment, sent_count, failed_count, created_at FROM campaigns ORDER BY created_at DESC LIMIT 10"
-        ).fetchall()
-    
-    if not campaigns:
-        await update.message.reply_text("No campaigns sent yet.")
-        return
-    
-    text = "<b>📊 Campaign History</b>\n\n"
-    for c in campaigns:
-        timestamp = c["created_at"][:16] if c["created_at"] else "N/A"
-        text += (f"<b>{c['segment']}</b> • {timestamp}\n"
-                f"  Sent: {c['sent_count']}, Failed: {c['failed_count']}\n\n")
-    
-    await update.message.reply_html(text)
-
-
-
-
-def mark_user_as_bounce(user_id):
-    """Mark user as bounce (viewed QR but didn't complete purchase)."""
-    with db() as conn:
-        # Check if they already have approved purchases
-        has_purchase = conn.execute(
-            "SELECT 1 FROM purchases WHERE user_id=? AND status='approved'",
-            (user_id,)
-        ).fetchone()
-        
-        if not has_purchase:
-            # Update segment to bounce
-            existing = conn.execute(
-                "SELECT segment FROM user_segments WHERE user_id=?",
-                (user_id,)
-            ).fetchone()
-            
-            if existing and existing["segment"] == "unpaid":
-                conn.execute(
-                    "UPDATE user_segments SET segment='bounce', reason=?, updated_at=? WHERE user_id=?",
-                    (f"Viewed QR on {datetime.now(TZ).date()} but didn't complete purchase", 
-                     datetime.utcnow().isoformat(), user_id)
-                )
-            else:
-                conn.execute(
-                    "INSERT OR IGNORE INTO user_segments (user_id, segment, reason, created_at, updated_at) VALUES (?,?,?,?,?)",
-                    (user_id, "bounce", "Viewed QR but didn't complete purchase",
-                     datetime.utcnow().isoformat(), datetime.utcnow().isoformat())
-                )
-
-def update_user_segment(user_id):
-    """Automatically update user segment based on current state."""
-    with db() as conn:
-        # Check if blocked
-        is_blocked = conn.execute(
-            "SELECT 1 FROM blocked_users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-        
-        if is_blocked:
-            segment = "fraud"
-            reason = "Blocked by admin"
-        else:
-            # Check purchase status
-            pending = conn.execute(
-                "SELECT 1 FROM purchases WHERE user_id=? AND status='pending'",
-                (user_id,)
-            ).fetchone()
-            
-            approved = conn.execute(
-                "SELECT 1 FROM purchases WHERE user_id=? AND status='approved'",
-                (user_id,)
-            ).fetchone()
-            
-            if approved:
-                segment = "purchased"
-                reason = "Has approved purchases"
-            elif pending:
-                segment = "pending"
-                reason = "Has pending payment verification"
-            else:
-                segment = "unpaid"
-                reason = "No purchases"
-        
-        conn.execute(
-            "UPDATE OR IGNORE user_segments SET segment=?, reason=?, updated_at=? WHERE user_id=?",
-            (segment, reason, datetime.utcnow().isoformat(), user_id)
-        )
-
-
-
-
-async def cmd_user_list(update, context):
-    """Admin: View complete user list with segmentation."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    segment_filter = args[0].lower() if args else None
-    
-    with db() as conn:
-        if segment_filter:
-            rows = conn.execute(
-                "SELECT us.user_id, us.segment, us.reason, u.username, u.first_name, us.updated_at "
-                "FROM user_segments us LEFT JOIN users u ON us.user_id = u.user_id "
-                "WHERE us.segment=? ORDER BY us.updated_at DESC",
-                (segment_filter,)
-            ).fetchall()
-            title = f"<b>{segment_filter.upper()}</b> Users ({len(rows)})"
-        else:
-            rows = conn.execute(
-                "SELECT us.user_id, us.segment, us.reason, u.username, u.first_name, us.updated_at "
-                "FROM user_segments us LEFT JOIN users u ON us.user_id = u.user_id "
-                "ORDER BY us.segment, us.updated_at DESC"
-            ).fetchall()
-            title = f"<b>ALL USERS</b> ({len(rows)})"
-    
-    if not rows:
-        await update.message.reply_text(f"No users in segment: {segment_filter}")
-        return
-    
-    # Build user list
-    text = f"{title}\n\n"
-    
-    current_segment = None
-    for row in rows:
-        if row["segment"] != current_segment:
-            current_segment = row["segment"]
-            text += f"\n<b>📍 {current_segment.upper()}</b>\n"
-        
-        username = row["username"] or "N/A"
-        name = row["first_name"] or "Unknown"
-        text += f"  {row['user_id']} | @{username} ({name})\n"
-    
-    # Split into chunks if too long
-    if len(text) > 4000:
-        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for chunk in chunks:
-            await update.message.reply_html(chunk)
-    else:
-        await update.message.reply_html(text)
-
-async def cmd_segment_stats(update, context):
-    """Admin: View segment statistics."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    with db() as conn:
-        stats = conn.execute(
-            "SELECT segment, COUNT(*) as count FROM user_segments GROUP BY segment ORDER BY count DESC"
-        ).fetchall()
-    
-    text = "<b>📊 USER SEGMENTS</b>\n\n"
-    total = 0
-    
-    segment_emoji = {
-        "purchased": "✅",
-        "pending": "⏳",
-        "unpaid": "❌",
-        "bounce": "🚪",
-        "fraud": "🚫"
-    }
-    
-    for row in stats:
-        emoji = segment_emoji.get(row["segment"], "📍")
-        text += f"{emoji} <b>{row['segment'].upper()}</b>: {row['count']}\n"
-        total += row["count"]
-    
-    text += f"\n<b>Total:</b> {total}"
-    await update.message.reply_html(text)
-
-async def cmd_move_segment(update, context):
-    """Admin: Move user to different segment."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: /move_segment <user_id> <segment>\n\n"
-            "Segments: fraud, bounce, unpaid, pending, purchased"
-        )
-        return
-    
-    try:
-        user_id = int(args[0])
-        segment = args[1].lower()
-    except:
-        await update.message.reply_text("Invalid arguments")
-        return
-    
-    if segment not in ["fraud", "bounce", "unpaid", "pending", "purchased"]:
-        await update.message.reply_text(f"Invalid segment: {segment}")
-        return
-    
-    with db() as conn:
-        conn.execute(
-            "UPDATE user_segments SET segment=?, reason=?, updated_at=? WHERE user_id=?",
-            (segment, f"Moved by admin", datetime.utcnow().isoformat(), user_id)
-        )
-    
-    await update.message.reply_html(f"✅ User {user_id} moved to {segment}")
-
-
-
-
-# ============================================================================
-# USER TRACKING & SEGMENTATION SYSTEM
-# ============================================================================
-
-def categorize_user(user_id):
-    """
-    Categorize user with enhanced segmentation:
-    - fraud: blocked users (exclude from all campaigns)
-    - bounce: visited QR page but never submitted proof
-    - unpaid: never interacted with payment
-    - pending: submitted proof, awaiting approval
-    - purchased: has 1 approved purchase
-    - vip: has 2+ approved purchases
-    - inactive: no activity
-    - dnd: do not disturb
-    - unknown: uncategorized
-    """
-    with db() as conn:
-        # Get purchase history
-        purchases = conn.execute(
-            "SELECT status, created_at FROM purchases WHERE user_id=? ORDER BY created_at",
-            (user_id,)
-        ).fetchall()
-        
-        # Get user creation date
-        user = conn.execute(
-            "SELECT created_at, username FROM users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-        
-        if not user:
-            return "unknown"
-        
-        # FRAUD: Check if user is blocked
-        blocked = conn.execute(
-            "SELECT 1 FROM blocked_users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-        if blocked:
-            return "fraud"
-        
-        # DND: Check do not disturb
-        dnd = conn.execute(
-            "SELECT 1 FROM dnd_users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-        if dnd:
-            return "dnd"
-        
-        # Check if user has any purchase attempts
-        if not purchases:
-            # BOUNCE: User visited but never initiated purchase
-            # Check user logs for QR page visit
-            qr_visits = conn.execute(
-                "SELECT COUNT(*) as count FROM user_logs WHERE user_id=? AND action='qr_viewed'",
-                (user_id,)
-            ).fetchone()
-            
-            if qr_visits and qr_visits["count"] > 0:
-                # User viewed QR but never submitted proof
-                return "bounce"
-            else:
-                # UNPAID: Never even tried to purchase
-                return "unpaid"
-        
-        # Has purchase attempts - analyze status
-        approved = [p for p in purchases if p["status"] == "approved"]
-        pending = [p for p in purchases if p["status"] in ("pending", "verifying")]
-        rejected = [p for p in purchases if p["status"] == "rejected"]
-        
-        # PENDING: Has pending but no approved purchases
-        if pending and not approved:
-            return "pending"
-        
-        # PURCHASED / VIP: Has approved purchases
-        if approved:
-            if len(approved) >= 2:
-                return "vip"  # 2+ approved purchases
-            else:
-                return "purchased"  # 1 approved purchase
-        
-        # BOUNCE: Has rejected purchases but no approved
-        # User tried but payment was rejected
-        if rejected and not approved:
-            return "bounce"
-        
-        # INACTIVE: No clear activity pattern
-        return "inactive"
-
-async def cmd_users_list(update, context):
-    """Admin: Show complete list of all users with details and filtering."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    filter_segment = args[0].lower() if args else None
-    
-    with db() as conn:
-        all_users = conn.execute(
-            "SELECT user_id, username, first_name, created_at FROM users ORDER BY created_at DESC"
-        ).fetchall()
-    
-    # Categorize each user
-    user_segments = {}
-    for user in all_users:
-        segment = categorize_user(user["user_id"])
-        if segment not in user_segments:
-            user_segments[segment] = []
-        user_segments[segment].append(user)
-    
-    # If filter specified, show only that segment
-    if filter_segment:
-        if filter_segment not in user_segments:
-            await update.message.reply_text(f"No users in segment: {filter_segment}")
-            return
-        
-        users = user_segments[filter_segment]
-        text = f"<b>📋 {filter_segment.upper()} USERS ({len(users)})</b>\n\n"
-        
-        for u in users[:50]:  # Limit to 50 per message
-            name = (u["first_name"] or u["username"] or f"User{u['user_id']}").replace("<", "&lt;").replace(">", "&gt;")
-            text += f"<code>{u['user_id']}</code> • {name}\n"
-        
-        if len(users) > 50:
-            text += f"\n... and {len(users) - 50} more"
-        
-        await update.message.reply_html(text)
-        return
-    
-    # Show summary of all segments
-    text = "<b>👥 USER SEGMENTATION</b>\n\n"
-    
-    segments_order = [
-        "new", "browsing", "pending", "active", "vip",
-        "failed", "inactive", "blocked", "dnd", "unknown"
-    ]
-    
-    for segment in segments_order:
-        if segment in user_segments:
-            count = len(user_segments[segment])
-            emoji = {
-                "new": "🆕",
-                "browsing": "👀",
-                "pending": "⏳",
-                "active": "✅",
-                "vip": "👑",
-                "failed": "❌",
-                "inactive": "💤",
-                "blocked": "🚫",
-                "dnd": "🔇",
-                "unknown": "❓"
-            }.get(segment, "•")
-            
-            text += f"{emoji} <b>{segment.upper()}</b>: {count}\n"
-    
-    text += (f"\n<i>Reply with segment name to view users</i>\n"
-            f"Example: /users_list active")
-    
-    await update.message.reply_html(text)
-
-async def cmd_user_profile(update, context):
-    """Admin: Show detailed profile for a specific user."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Usage: /user_profile <user_id>")
-        return
-    
-    try:
-        user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid user ID")
-        return
-    
-    with db() as conn:
-        user = conn.execute(
-            "SELECT * FROM users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-        
-        if not user:
-            await update.message.reply_text("User not found")
-            return
-        
-        purchases = conn.execute(
-            "SELECT * FROM purchases WHERE user_id=?",
-            (user_id,)
-        ).fetchall()
-        
-        blocked = conn.execute(
-            "SELECT reason, blocked_at FROM blocked_users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-        
-        dnd = conn.execute(
-            "SELECT 1 FROM dnd_users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-    
-    # Build profile
-    segment = categorize_user(user_id)
-    
-    text = f"<b>👤 USER PROFILE</b>\n\n"
-    text += f"<b>ID:</b> <code>{user_id}</code>\n"
-    text += f"<b>Name:</b> {user['first_name'] or 'N/A'} {user.get('last_name') or ''}\n"
-    text += f"<b>Username:</b> @{user['username'] or 'N/A'}\n"
-    text += f"<b>Segment:</b> {segment.upper()}\n"
-    text += f"<b>Joined:</b> {user['created_at'][:10]}\n"
-    
-    if blocked:
-        text += f"\n🚫 <b>BLOCKED</b>\n"
-        text += f"Reason: {blocked['reason']}\n"
-        text += f"Date: {blocked['blocked_at'][:10]}\n"
-    
-    if dnd:
-        text += f"\n🔇 <b>DO NOT DISTURB</b>\n"
-    
-    text += f"\n<b>📊 PURCHASE HISTORY ({len(purchases)})</b>\n"
-    
-    if purchases:
-        for p in purchases:
-            status_emoji = "✅" if p["status"] == "approved" else "⏳" if p["status"] in ("pending", "verifying") else "❌"
-            text += f"{status_emoji} {p['channel_name']} • ₹{p['amount']} • {p['status']}\n"
-    else:
-        text += "No purchases\n"
-    
-    text += f"\n<b>💰 TOTAL SPENT:</b> ₹{sum(int(p['amount']) or 0 for p in purchases)}\n"
-    
-    # Buttons
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Send Message", callback_data=f"user_msg:{user_id}")],
-        [InlineKeyboardButton("🔒 Block" if not blocked else "🔓 Unblock", 
-                             callback_data=f"user_block:{user_id}")],
-        [InlineKeyboardButton("🔇 DND" if not dnd else "🔊 Unmute", 
-                             callback_data=f"user_dnd:{user_id}")],
-    ])
-    
-    await update.message.reply_html(text, reply_markup=kb)
-
-async def cmd_segment_stats(update, context):
-    """Admin: Show detailed statistics for each user segment."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    with db() as conn:
-        all_users = conn.execute(
-            "SELECT user_id FROM users"
-        ).fetchall()
-    
-    # Categorize all users
-    segments = {}
-    for user in all_users:
-        segment = categorize_user(user["user_id"])
-        if segment not in segments:
-            segments[segment] = {"count": 0, "revenue": 0, "purchases": 0}
-        segments[segment]["count"] += 1
-        
-        # Get revenue from this segment
-        with db() as conn:
-            purchases = conn.execute(
-                "SELECT amount, status FROM purchases WHERE user_id=?",
-                (user["user_id"],)
-            ).fetchall()
-        
-        approved_purchases = [p for p in purchases if p["status"] == "approved"]
-        if approved_purchases:
-            segments[segment]["purchases"] += len(approved_purchases)
-            segments[segment]["revenue"] += sum(int(p["amount"]) or 0 for p in approved_purchases)
-    
-    # Display stats
-    text = "<b>📊 USER SEGMENT ANALYTICS</b>\n\n"
-    text += f"<b>Total Users:</b> {len(all_users)}\n\n"
-    
-    total_revenue = sum(s["revenue"] for s in segments.values())
-    
-    segments_order = [
-        "new", "browsing", "pending", "active", "vip",
-        "failed", "inactive", "blocked", "dnd", "unknown"
-    ]
-    
-    for segment in segments_order:
-        if segment in segments:
-            s = segments[segment]
-            emoji = {
-                "new": "🆕", "browsing": "👀", "pending": "⏳", "active": "✅", "vip": "👑",
-                "failed": "❌", "inactive": "💤", "blocked": "🚫", "dnd": "🔇", "unknown": "❓"
-            }.get(segment, "•")
-            
-            pct = (s["count"] / len(all_users) * 100) if all_users else 0
-            
-            text += (f"{emoji} <b>{segment.upper()}</b>\n"
-                    f"  Users: {s['count']} ({pct:.1f}%)\n"
-                    f"  Revenue: ₹{s['revenue']}\n"
-                    f"  Purchases: {s['purchases']}\n\n")
-    
-    text += f"<b>💰 Total Revenue:</b> ₹{total_revenue}\n"
-    
-    await update.message.reply_html(text)
-
-async def cmd_filter_users(update, context):
-    """Admin: Filter users by multiple criteria."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "Usage: /filter_users <criteria>\n\n"
-            "Criteria:\n"
-            "  segment:<name>  → unpaid, pending, active, vip, blocked, dnd\n"
-            "  spent:<amount>  → users who spent ≥ amount (e.g., spent:500)\n"
-            "  purchases:<num> → users with ≥ num purchases\n"
-            "  recent:<days>   → users joined in last X days\n\n"
-            "Examples:\n"
-            "  /filter_users segment:active\n"
-            "  /filter_users spent:1000\n"
-            "  /filter_users recent:7"
-        )
-        return
-    
-    criteria = args[0].split(":")
-    if len(criteria) != 2:
-        await update.message.reply_text("Invalid criteria format")
-        return
-    
-    ctype, cvalue = criteria[0].lower(), criteria[1]
-    filtered_users = []
-    
-    with db() as conn:
-        all_users = conn.execute("SELECT user_id FROM users").fetchall()
-    
-    for user in all_users:
-        user_id = user["user_id"]
-        
-        if ctype == "segment":
-            if categorize_user(user_id) == cvalue:
-                filtered_users.append(user_id)
-        
-        elif ctype == "spent":
-            with db() as conn:
-                total = conn.execute(
-                    "SELECT SUM(amount) as total FROM purchases WHERE user_id=? AND status='approved'",
-                    (user_id,)
-                ).fetchone()
-            if total and total["total"] and int(total["total"]) >= int(cvalue):
-                filtered_users.append(user_id)
-        
-        elif ctype == "purchases":
-            with db() as conn:
-                count = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM purchases WHERE user_id=? AND status='approved'",
-                    (user_id,)
-                ).fetchone()
-            if count and count["cnt"] >= int(cvalue):
-                filtered_users.append(user_id)
-        
-        elif ctype == "recent":
-            with db() as conn:
-                user_data = conn.execute(
-                    "SELECT created_at FROM users WHERE user_id=?",
-                    (user_id,)
-                ).fetchone()
-            if user_data:
-                created = datetime.fromisoformat(user_data["created_at"])
-                days_ago = (datetime.utcnow() - created).days
-                if days_ago <= int(cvalue):
-                    filtered_users.append(user_id)
-    
-    text = f"<b>🔍 FILTERED RESULTS: {len(filtered_users)} users</b>\n\n"
-    text += f"Criteria: <code>{ctype}:{cvalue}</code>\n\n"
-    
-    for uid in filtered_users[:50]:
-        with db() as conn:
-            u = conn.execute("SELECT first_name, username FROM users WHERE user_id=?", (uid,)).fetchone()
-        name = (u["first_name"] or u["username"] or f"User{uid}").replace("<", "&lt;")
-        text += f"<code>{uid}</code> • {name}\n"
-    
-    if len(filtered_users) > 50:
-        text += f"\n... and {len(filtered_users) - 50} more"
-    
-    text += f"\n\nUse <code>/send_offer {','.join(str(u) for u in filtered_users[:5])} &lt;message&gt;</code> to reach them"
-    
-    await update.message.reply_html(text)
-
-async def cmd_segment_target(update, context):
-    """Admin: Send message to entire segment."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "Usage: /segment_target <segment> <message>\n\n"
-            "Segments: new, browsing, pending, active, vip, failed, inactive\n\n"
-            "Example: /segment_target pending Reminder: Complete your payment!"
-        )
-        return
-    
-    segment = args[0].lower()
-    message = " ".join(args[1:])
-    
-    with db() as conn:
-        all_users = conn.execute("SELECT user_id FROM users").fetchall()
-    
-    target_users = [u["user_id"] for u in all_users if categorize_user(u["user_id"]) == segment]
-    
-    if not target_users:
-        await update.message.reply_text(f"No users in segment: {segment}")
-        return
-    
-    success = 0
-    failed = 0
-    
-    for user_id in target_users:
-        try:
-            await context.bot.send_message(
-                user_id,
-                message,
-                parse_mode=ParseMode.HTML,
-                disable_notification=False
-            )
-            success += 1
-        except Exception as e:
-            failed += 1
-    
-    await update.message.reply_html(
-        f"<b>✅ Segment Message Sent</b>\n\n"
-        f"Segment: <b>{segment.upper()}</b>\n"
-        f"Sent: <b>{success}</b>\n"
-        f"Failed: <b>{failed}</b>\n"
-        f"Total: <b>{success + failed}</b>"
-    )
-    log.info(f"Segment {segment}: {success} sent, {failed} failed")
-
-
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
         raise RuntimeError("Set BOT_TOKEN and ADMIN_ID env vars.")
@@ -4600,6 +4111,8 @@ def main():
 
     # User
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(cb_fallback_menu,  pattern=r"^fallback_menu$"))
+    app.add_handler(CallbackQueryHandler(cb_buy_bundle,     pattern=r"^buy_bundle:"))
     app.add_handler(CallbackQueryHandler(cb_back_to_start,  pattern=r"^back_to_start$"))
     app.add_handler(CallbackQueryHandler(cb_buy,          pattern=r"^buy:"))
     app.add_handler(CallbackQueryHandler(cb_upi_start,    pattern=r"^upi:start:"))
@@ -4631,6 +4144,7 @@ def main():
     app.add_handler(CommandHandler("block",     cmd_block))
     app.add_handler(CommandHandler("unblock",     cmd_unblock))
     app.add_handler(CommandHandler("away",              cmd_away))
+    app.add_handler(CommandHandler("fallback_toggle",   cmd_fallback_toggle))
     app.add_handler(CommandHandler("special_offers_toggle", cmd_special_offers_toggle))
     app.add_handler(CommandHandler("show_channels",     cmd_show_channels))
     app.add_handler(CommandHandler("show_channels_status", cmd_show_channels_status))
@@ -4653,20 +4167,6 @@ def main():
         on_csv_import_file
     ))
     app.add_handler(CommandHandler("restore",     cmd_restore))
-
-    app.add_handler(CommandHandler("send_offer", cmd_send_offer))
-    app.add_handler(CommandHandler("retarget", cmd_retarget))
-    app.add_handler(CommandHandler("campaign_stats", cmd_campaign_stats))
-
-    app.add_handler(CommandHandler("user_list", cmd_user_list))
-    app.add_handler(CommandHandler("segment_stats", cmd_segment_stats))
-    app.add_handler(CommandHandler("move_segment", cmd_move_segment))
-
-    app.add_handler(CommandHandler("users_list", cmd_users_list))
-    app.add_handler(CommandHandler("user_profile", cmd_user_profile))
-    app.add_handler(CommandHandler("segment_stats", cmd_segment_stats))
-    app.add_handler(CommandHandler("filter_users", cmd_filter_users))
-    app.add_handler(CommandHandler("segment_target", cmd_segment_target))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^adm:"))
 
     jq = app.job_queue
