@@ -887,7 +887,7 @@ def build_multi_tier_keyboard():
     # Add bundle offers button if configured
     if os.getenv("BUNDLE_1"):
         keyboard.append([
-            InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")
+            InlineKeyboardButton("⭐⭐⭐ ₹9 ⭐⭐⭐", callback_data="show_bundles")
         ])
     
     # Add back button
@@ -900,8 +900,8 @@ def build_multi_tier_keyboard():
 def build_single_tier_keyboard():
     """Build default single-tier keyboard (₹99 entry point)."""
     keyboard = [
-        [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99", callback_data="buy_tier:1")],
-        [InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")],
+        [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99 ⭐", callback_data="buy_tier:1")],
+        [InlineKeyboardButton("⭐⭐⭐ ₹9 ⭐⭐⭐", callback_data="show_bundles")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1013,7 +1013,7 @@ async def cmd_start(update, context):
         # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
             rows.append([InlineKeyboardButton(
-                "📦 See Budget Bundles", callback_data="fallback_menu"
+                "⭐⭐⭐ ₹9 ⭐⭐⭐", callback_data="fallback_menu"
             )])
 
     else:
@@ -1107,7 +1107,7 @@ async def cb_fallback_menu(update, context):
     ]
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
+        [InlineKeyboardButton(f"⭐ {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
         for name, price in bundles
     ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
     
@@ -1305,7 +1305,7 @@ async def cb_buy(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✍️✍️✍️ I've Paid ✍️✍️✍️", callback_data=f"upi:start:{pid}")
     ]])
 
     with open(qr_path, "rb") as fh:
@@ -1364,7 +1364,7 @@ async def send_upi_prompt(context):
         f"✅ Paid?"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid",
+        InlineKeyboardButton("✍️✍️✍️ I've Paid ✍️✍️✍️",
                              callback_data=f"upi:start:{pid}")
     ]])
     try:
@@ -1790,7 +1790,7 @@ async def cb_admin(update, context):
                     )])
                     if is_fallback_enabled():
                         rows.append([InlineKeyboardButton(
-                            "📦 See Budget Bundles", callback_data="fallback_menu"
+                            "⭐⭐⭐ ₹9 ⭐⭐⭐", callback_data="fallback_menu"
                         )])
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
@@ -2430,7 +2430,7 @@ async def cmd_away(update, context):
 async def cmd_fallback_toggle(update, context):
     """Admin: /fallback_toggle <on|off> — enable/disable fallback bundle offers
     
-    When enabled: Unpaid users see "📦 See Fallback Offers" button
+    When enabled: Unpaid users see "⭐⭐See Fallback Offers" button
     When disabled: Unpaid users see only primary offer (no fallback bundles)
     
     Examples:
