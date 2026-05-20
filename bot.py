@@ -88,7 +88,7 @@ def _parse_bundle(price: int, s: str):
 
 BUNDLES = {}  # {price: bundle_info}
 bundle_config = [
-    (9, "BUNDLE_1"),
+    (30, "BUNDLE_1"),
     (59, "BUNDLE_5"),
     (79, "BUNDLE_10"),
     (99, "BUNDLE_15"),
@@ -887,7 +887,7 @@ def build_multi_tier_keyboard():
     # Add bundle offers button if configured
     if os.getenv("BUNDLE_1"):
         keyboard.append([
-            InlineKeyboardButton("⭐STRAT ₹9⭐", callback_data="show_bundles")
+            InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")
         ])
     
     # Add back button
@@ -900,8 +900,8 @@ def build_multi_tier_keyboard():
 def build_single_tier_keyboard():
     """Build default single-tier keyboard (₹99 entry point)."""
     keyboard = [
-        [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99 ⭐", callback_data="buy_tier:1")],
-        [InlineKeyboardButton("⭐STRAT ₹9⭐", callback_data="show_bundles")],
+        [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99", callback_data="buy_tier:1")],
+        [InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1013,7 +1013,7 @@ async def cmd_start(update, context):
         # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
             rows.append([InlineKeyboardButton(
-                "⭐STRAT ₹9⭐", callback_data="fallback_menu"
+                "📦 See Budget Bundles", callback_data="fallback_menu"
             )])
 
     else:
@@ -1100,18 +1100,24 @@ async def cb_fallback_menu(update, context):
     
     # Bundle options: (display_name, price_rupees)
     bundles = [
-        ("1 Channel", 9),
+        ("1 Channel", 30),
+        ("5 Channels", 59),
+        ("10 Channels", 79),
+        ("15 Channels", 99),
     ]
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"⭐ {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
+        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
         for name, price in bundles
     ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
     
-    text = (f"<b>💰 100% TRUSTED</b>\n\n"
+    text = (f"<b>💰 Budget Bundles</b>\n\n"
             f"Get started with affordable options:\n\n"
-            f"• <b>1 Channel</b> — ₹9\n"
-            f"<i>Try and upgrade to ₹99 SOON!</i>")
+            f"• <b>1 Channel</b> — ₹30\n"
+            f"• <b>5 Channels</b> — ₹59\n"
+            f"• <b>10 Channels</b> — ₹79\n"
+            f"• <b>15 Channels</b> — ₹99\n\n"
+            f"<i>Tap any bundle to proceed with payment</i>")
     
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -1164,7 +1170,7 @@ async def cb_buy_bundle(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️✍️✍️ I've Paid ✍️✍️✍️", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
     ]])
     
     with open(qr_path, "rb") as fh:
@@ -1299,7 +1305,7 @@ async def cb_buy(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️✍️✍️ I've Paid ✍️✍️✍️", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
     ]])
 
     with open(qr_path, "rb") as fh:
@@ -1358,7 +1364,7 @@ async def send_upi_prompt(context):
         f"✅ Paid?"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️✍️✍️ I've Paid ✍️✍️✍️",
+        InlineKeyboardButton("✍️ I've Paid",
                              callback_data=f"upi:start:{pid}")
     ]])
     try:
@@ -1784,7 +1790,7 @@ async def cb_admin(update, context):
                     )])
                     if is_fallback_enabled():
                         rows.append([InlineKeyboardButton(
-                            "⭐STRAT ₹9⭐", callback_data="fallback_menu"
+                            "📦 See Budget Bundles", callback_data="fallback_menu"
                         )])
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
@@ -2424,7 +2430,7 @@ async def cmd_away(update, context):
 async def cmd_fallback_toggle(update, context):
     """Admin: /fallback_toggle <on|off> — enable/disable fallback bundle offers
     
-    When enabled: Unpaid users see "⭐⭐See Fallback Offers" button
+    When enabled: Unpaid users see "📦 See Fallback Offers" button
     When disabled: Unpaid users see only primary offer (no fallback bundles)
     
     Examples:
