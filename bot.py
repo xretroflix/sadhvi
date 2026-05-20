@@ -626,6 +626,21 @@ def schedule_auto_delete(context, chat_id, message_id, delay_seconds=30):
         name=f"autodel_{chat_id}_{message_id}",
     )
 
+async def delete_away_message(context, user_id: int):
+    """Instantly delete the away message sent to a user (if it still exists)."""
+    mid_str = get_admin_setting(f"away_msg_id_{user_id}", "")
+    if not mid_str:
+        return
+    try:
+        mid = int(mid_str)
+        await context.bot.delete_message(chat_id=user_id, message_id=mid)
+    except Exception as e:
+        log.debug(f"delete_away_message failed for {user_id}: {e}")
+    finally:
+        # Clear the stored ID regardless of whether delete succeeded
+        set_admin_setting(f"away_msg_id_{user_id}", "")
+
+
 async def auto_wipe_user_chat(context):
     """JobQueue callback: wipe ALL bot MESSAGES for a user after delay.
     Called automatically X minutes after approval/rejection.
@@ -750,6 +765,9 @@ async def full_reset(context, user_id: int):
             log.debug(f"full_reset delete {mid} failed: {e}")
 
     log.info(f"full_reset: deleted {deleted} messages for user {user_id}")
+
+    # Remove any pending away message immediately
+    await delete_away_message(context, user_id)
 
     # Wipe all DB state
     reset_user_data(user_id)
@@ -1524,12 +1542,17 @@ async def on_text_message(update, context):
     away_msg = get_admin_setting("away_message", "")
     if away_msg:
         try:
-            await context.bot.send_message(
+            away_m = await context.bot.send_message(
                 chat_id=user.id,
                 text=f"⏰ <b>Admin is currently away</b>\n\n{away_msg}",
                 parse_mode=ParseMode.HTML,
                 disable_notification=True,
             )
+            track_msg(user.id, away_m.message_id)
+            # Store so approval/rejection/reset can delete it immediately
+            set_admin_setting(f"away_msg_id_{user.id}", str(away_m.message_id))
+            # Auto-delete after 30 seconds if not already removed
+            schedule_auto_delete(context, user.id, away_m.message_id, delay_seconds=30)
         except Exception:
             pass
 
@@ -1642,6 +1665,8 @@ async def cb_admin(update, context):
                 show_alert=False)
         except Exception:
             pass
+        # Remove any pending away message immediately
+        await delete_away_message(context, target_user_id)
         await _edit_admin_card(q,
             extra=f"\n\n🧹 <b>WIPED</b> {datetime.now(TZ):%d-%b %H:%M}")
         return
@@ -1844,6 +1869,9 @@ async def cb_admin(update, context):
         # When user returns later, chat will look fresh.
         schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
 
+        # Remove any pending away message from the user's chat immediately
+        await delete_away_message(context, user_id)
+
         # Auto-backup DB right after approval — captures purchase records
         # immediately, so a Railway redeploy won't lose this user.
         await event_backup(context)
@@ -1853,31 +1881,56 @@ async def cb_admin(update, context):
                         rejected_at=datetime.utcnow().isoformat())
 
         # Build keyboard for rejection. Logic:
+        #   - If rejected purchase was a bundle → show retry button for that exact bundle
         #   - Owned channels → ✅ Join button
-        #   - Tier 1 not owned → only show Tier 1 retry button (others gated)
+        #   - The rejected channel → 🔁 Try Again (pack-specific label + price)
+        #   - Tier 1 not owned + rejected pack was higher tier → show only Tier 1 retry
         #   - Tier 1 owned → show all unowned tiers as 🔒 buttons
         owned_now = get_owned_channel_ids(user_id)
         owns_tier1 = (CHANNELS and CHANNELS[0]["id"] in owned_now)
         kb_rows = []
-        for c in CHANNELS:
-            if c["id"] in owned_now:
-                # Already owned → green tick + Join URL
+
+        if p["channel_id"] == 0:
+            # BUNDLE rejection — show retry for that exact bundle
+            bundle_price = p["amount"]
+            if bundle_price in BUNDLES:
+                bundle = BUNDLES[bundle_price]
                 kb_rows.append([InlineKeyboardButton(
-                    f"✅ {c['name']} — Join", url=c["link"]
+                    f"🔁 Try Again — {bundle['name']} ₹{bundle_price}",
+                    callback_data=f"buy_bundle:{bundle_price}",
                 )])
-            elif c["id"] == CHANNELS[0]["id"]:
-                # Tier 1 — always show the retry button
+            else:
                 kb_rows.append([InlineKeyboardButton(
-                    f"🔁 Try Again — {c['name']} ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
+                    f"🔁 Try Again — Bundle ₹{bundle_price}",
+                    callback_data=f"buy_bundle:{bundle_price}",
                 )])
-            elif owns_tier1:
-                # Higher tier, user has Tier 1 → show as buyable
-                kb_rows.append([InlineKeyboardButton(
-                    f"🔒 {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
-                )])
-            # else: higher tier, user lacks Tier 1 → hide it (would just block)
+        else:
+            # CHANNEL rejection
+            for c in CHANNELS:
+                if c["id"] in owned_now:
+                    # Already owned → green tick + Join URL
+                    kb_rows.append([InlineKeyboardButton(
+                        f"✅ {c['name']} — Join", url=c["link"]
+                    )])
+                elif c["id"] == p["channel_id"]:
+                    # The rejected pack → show pack-specific retry button
+                    kb_rows.append([InlineKeyboardButton(
+                        f"🔁 Try Again — {c['name']} ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                elif c["id"] == CHANNELS[0]["id"] and not owns_tier1:
+                    # Tier 1 not owned and this isn't the rejected pack → show Tier 1 retry
+                    kb_rows.append([InlineKeyboardButton(
+                        f"🔁 Try Again — {c['name']} ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                elif owns_tier1:
+                    # Higher tier, user has Tier 1 → show as buyable
+                    kb_rows.append([InlineKeyboardButton(
+                        f"🔒 {c['name']} — ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                # else: higher tier, user lacks Tier 1 → hide it (would just block)
         reject_kb = InlineKeyboardMarkup(kb_rows)
 
         if p.get("main_msg_id"):
@@ -1896,6 +1949,9 @@ async def cb_admin(update, context):
 
         # Auto-wipe user chat after delay so it looks fresh next time
         schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
+
+        # Remove any pending away message from the user's chat immediately
+        await delete_away_message(context, user_id)
 
         # Auto-backup DB right after rejection — captures the audit trail.
         await event_backup(context)
@@ -2235,31 +2291,61 @@ async def cmd_help(update, context):
     text = (
         "🛠 <b>Admin Commands</b>\n\n"
 
-        "<b>📊 Stats &amp; reports</b>\n"
-        "/stats — totals, revenue, status counts\n"
-        "/pending — users awaiting approval\n"
-        "/summary — yesterday's full summary + CSV\n"
-        "/listusers — last 30 users\n"
-        "/find &lt;text&gt; — search by name/username\n"
-        "/whoami [id] — DB state for one user\n\n"
+        "<b>📊 Stats &amp; Reports</b>\n"
+        "/stats — Overall totals: users, revenue, and purchase counts grouped by status (started / verifying / approved / rejected).\n"
+        "/pending — Lists all purchases currently awaiting your approval (status: verifying or screenshot_requested). Shows name, UPI, amount, and a direct chat link.\n"
+        "/summary — Sends yesterday's daily summary (new users, attempts, approvals, rejections, revenue) plus a CSV attachment with every transaction for that day. Optionally pass a date: <code>/summary 2025-06-01</code>\n"
+        "/listusers — Last 30 registered users with their approved purchase count and total revenue. Tap a name to open their chat.\n"
+        "/find &lt;text&gt; — Search users by first name, last name, or username. Returns up to 20 matches with direct chat links.\n"
+        "/whoami [user_id] — Full DB snapshot for a user: profile info, all purchase records, statuses, and tracked message IDs. Omit the ID to inspect your own account.\n\n"
 
-        "<b>🧹 Cleanup (single user)</b>\n"
-        "/wipe &lt;id&gt; — clear chat, keep purchases\n"
-        "/reset &lt;id&gt; — full reset (delete purchases too)\n"
-        "/resetme — reset yourself (testing)\n\n"
+        "<b>🧹 Cleanup — Single User</b>\n"
+        "/wipe &lt;user_id&gt; — Deletes all bot messages in that user's chat and clears message tracking. Purchase records are kept, so the user is still recognised as paid on their next /start.\n"
+        "/reset &lt;user_id&gt; — Nuclear reset: deletes bot messages AND all purchase records for that user. They start completely fresh as if they never used the bot.\n"
+        "/resetme — Resets your own account (useful for testing the user flow as admin).\n\n"
 
-        "<b>☢️ Cleanup (ALL users)</b>\n"
-        "/wipeall YES — clear ALL chats, keep purchases\n"
-        "/resetall DELETE-EVERYTHING — nuclear reset\n\n"
+        "<b>☢️ Cleanup — ALL Users</b>\n"
+        "/wipeall YES — Wipes bot chat messages for every user in the DB. Purchase history is preserved. Requires the YES confirmation argument.\n"
+        "/resetall DELETE-EVERYTHING — Deletes bot messages AND all purchase records for every user. Irreversible. Requires the exact phrase as the argument.\n\n"
 
         "<b>📢 Communication</b>\n"
-        "/broadcast &lt;msg&gt; — send to all users\n"
-        "/msg &lt;user_id&gt; [message] — send message to one user or open chat\n\n"
+        "/broadcast &lt;message&gt; — Sends an announcement to every user in the DB. Supports HTML formatting. Reports sent/failed counts.\n"
+        "/msg &lt;user_id&gt; &lt;message&gt; — Sends a custom message to a specific user. Omit the message text to get a tap-to-open chat link instead.\n"
+        "/away &lt;message&gt; — Sets an away notice shown to users after they submit payment proof. Clears automatically after 30 s on the user's side. Use <code>/away off</code> to disable immediately.\n\n"
 
-        "<b>💾 DB backup</b>\n"
-        "/backup — get fresh DB file\n"
-        "/restore — reply to a .db file to restore\n"
-        "/import_csv — upload master_summary.csv to import purchase records\n\n"
+        "<b>🚫 User Control</b>\n"
+        "/block &lt;user_id&gt; [reason] — Blocks a user. Blocked users are silently ignored by the bot (no response to any interaction).\n"
+        "/unblock &lt;user_id&gt; — Removes a block, allowing the user to interact with the bot again.\n\n"
+
+        "<b>📦 Channel &amp; Pricing Control</b>\n"
+        "/show_channels &lt;ch_id&gt; &lt;segment&gt; &lt;1|0&gt; — Show or hide a channel for a user segment (all, unpaid, T1, T1,T2 …).\n"
+        "/show_channels_status — Lists all current channel visibility rules.\n"
+        "/channel_price &lt;ch_id&gt; &lt;segment&gt; &lt;price&gt; — Override the price of a channel for a specific segment. Use <code>default</code> as price to remove override.\n"
+        "/channel_price_status — Shows all active custom price overrides.\n\n"
+
+        "<b>🎁 Promotions</b>\n"
+        "/promo_set &lt;ch_id&gt; &lt;segment&gt; &lt;price&gt; — Activate a promotional price for a channel + segment combination.\n"
+        "/promo_clear &lt;ch_id&gt; &lt;segment&gt; — Deactivate the promotion for that channel + segment.\n"
+        "/promo_status — Lists all currently active promotions.\n"
+        "/promo_send &lt;ch_id&gt; &lt;segment&gt; — Broadcasts the promo price to all users in that segment.\n"
+        "/promo_personal &lt;user_id&gt; &lt;ch_id&gt; &lt;price&gt; — Sends a one-off personal offer to a specific user.\n"
+        "/offer_tier &lt;segment&gt; &lt;ch_id&gt; &lt;price&gt; CONFIRM — Bulk-sends an offer to every user in a segment. Requires CONFIRM argument as a safeguard.\n"
+        "/offer_user &lt;user_id&gt; &lt;ch_id&gt; &lt;price&gt; — Sends a targeted offer to one user.\n"
+        "/unpaid — Lists users who have never completed a purchase (useful for re-engagement campaigns).\n\n"
+
+        "<b>🔧 Feature Toggles</b>\n"
+        "/fallback_toggle &lt;on|off|status&gt; — Enable or disable the '📦 See Budget Bundles' button shown to unpaid users on /start.\n"
+        "/special_offers_toggle &lt;on|off|status&gt; — Enable or disable the promotion/offer commands globally.\n\n"
+
+        "<b>💾 Database Backup</b>\n"
+        "/backup — Sends the current live database file to you as a Telegram document (instant snapshot).\n"
+        "/restore — Reply to a .db file with this command to restore the database from that file.\n"
+        "/import_csv — Use after sending a master_summary.csv file; imports purchase records from the CSV into the DB.\n\n"
+
+        "<b>📋 Diagnostics</b>\n"
+        "/logs &lt;user_id&gt; — Shows the last 50 logged messages (text inputs, UPI names, screenshots) from a user.\n"
+        "/bulk_ids — Lists all user IDs in the DB (raw list, for scripting).\n"
+        "/bulk_promo_users &lt;segment&gt; — Lists user IDs belonging to a given segment.\n\n"
 
         "<i>Inline buttons on admin notifications:</i>\n"
         "✅ Approve · ❌ Reject · 📸 Request Screenshot\n"
