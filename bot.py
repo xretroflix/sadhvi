@@ -2228,176 +2228,157 @@ async def cmd_find(update, context):
     await update.message.reply_html(text, disable_web_page_preview=True)
 
 
-# ------------------------------------------------------------------
-# HELP: summary list with tappable buttons for per-command detail
-# ------------------------------------------------------------------
-HELP_DETAILS = {
-    "stats":    ("<b>/stats</b>\n\nOverall bot totals.\n\n"
-                 "<b>Shows:</b> total users, approved revenue, and purchase count per status (started / verifying / approved / rejected).\n\n"
-                 "<b>Example:</b> <code>/stats</code>"),
-    "pending":  ("<b>/pending</b>\n\nList all purchases awaiting your action.\n\n"
-                 "<b>Shows:</b> purchases with status <i>verifying</i> or <i>screenshot_requested</i> — name, UPI, amount, direct chat link.\n\n"
-                 "<b>Example:</b> <code>/pending</code>"),
-    "summary":  ("<b>/summary</b>\n\nYesterday's daily report + CSV attachment.\n\n"
-                 "<b>Shows:</b> new users, attempts, approvals, rejections, revenue. CSV has every transaction.\n\n"
-                 "<b>Example:</b> <code>/summary</code>\n"
-                 "Optional date: <code>/summary 2025-06-01</code>"),
-    "listusers":("<b>/listusers</b>\n\nLast 30 registered users with quick stats.\n\n"
-                 "<b>Shows:</b> name, username, ID, approved count, revenue. Tap name to open chat.\n\n"
-                 "<b>Example:</b> <code>/listusers</code>"),
-    "find":     ("<b>/find &lt;text&gt;</b>\n\nSearch users by name or username.\n\n"
-                 "<b>Returns:</b> up to 20 matches with direct chat links.\n\n"
-                 "<b>Example:</b> <code>/find Sakshi</code>"),
-    "whoami":   ("<b>/whoami [user_id]</b>\n\nFull DB snapshot for a user.\n\n"
-                 "<b>Shows:</b> profile info, all purchases, statuses, tracked message IDs. Omit ID to inspect yourself.\n\n"
-                 "<b>Example:</b> <code>/whoami 123456789</code>"),
-    "wipe":     ("<b>/wipe &lt;user_id&gt;</b>\n\nDelete all bot messages in user's chat. Purchase records kept — user stays paid on next /start.\n\n"
-                 "<b>Example:</b> <code>/wipe 123456789</code>"),
-    "reset":    ("<b>/reset &lt;user_id&gt;</b>\n\nNuclear reset: deletes bot messages AND all purchase records. User starts completely fresh.\n\n"
-                 "<b>Example:</b> <code>/reset 123456789</code>"),
-    "resetme":  ("<b>/resetme</b>\n\nReset your own admin account. Useful for testing the full user flow.\n\n"
-                 "<b>Example:</b> <code>/resetme</code>"),
-    "wipeall":  ("<b>/wipeall YES</b>\n\nWipe bot messages for every user. Purchase history is preserved.\n\n"
-                 "<b>Example:</b> <code>/wipeall YES</code>"),
-    "resetall": ("<b>/resetall DELETE-EVERYTHING</b>\n\nNuclear reset for ALL users — deletes messages AND all purchase records. Irreversible.\n\n"
-                 "<b>Example:</b> <code>/resetall DELETE-EVERYTHING</code>"),
-    "broadcast":("<b>/broadcast &lt;message&gt;</b>\n\nSend announcement to every user in DB. Supports HTML formatting. Reports sent/failed counts.\n\n"
-                 "<b>Example:</b> <code>/broadcast 🎉 New channel added!</code>"),
-    "msg":      ("<b>/msg &lt;user_id&gt; [message]</b>\n\nSend a custom message to one user. Omit message to get a tap-to-open chat link instead.\n\n"
-                 "<b>Example:</b> <code>/msg 123456789 Your payment is confirmed!</code>"),
-    "away":     ("<b>/away &lt;message&gt;</b>\n\nSet an away notice shown to users after they submit payment proof. Auto-clears in 30 s on user side; instantly cleared on approve/reject/wipe/reset.\n\n"
-                 "<b>Example:</b> <code>/away Back in 2 hours!</code>\n"
-                 "Disable: <code>/away off</code>"),
-    "block":    ("<b>/block &lt;user_id&gt; [reason]</b>\n\nBlock a user — silently ignored by the bot on all interactions.\n\n"
-                 "<b>Example:</b> <code>/block 123456789 repeated fake screenshots</code>"),
-    "unblock":  ("<b>/unblock &lt;user_id&gt;</b>\n\nRemove a block so the user can interact again.\n\n"
-                 "<b>Example:</b> <code>/unblock 123456789</code>"),
-    "show_channels": ("<b>/show_channels &lt;ch_id&gt; &lt;segment&gt; &lt;1|0&gt;</b>\n\nShow or hide a channel for a user segment.\n\n"
-                      "<b>Segments:</b> all, unpaid, T1, T1,T2 …\n"
-                      "<b>1</b> = show, <b>0</b> = hide\n\n"
-                      "<b>Example:</b> <code>/show_channels 2 unpaid 0</code>"),
-    "show_channels_status": ("<b>/show_channels_status</b>\n\nList all current channel visibility rules.\n\n"
-                             "<b>Example:</b> <code>/show_channels_status</code>"),
-    "channel_price": ("<b>/channel_price &lt;ch_id&gt; &lt;segment&gt; &lt;price|default&gt;</b>\n\nOverride price for a channel in a segment. Use <code>default</code> to remove override.\n\n"
-                      "<b>Example:</b> <code>/channel_price 1 unpaid 150</code>"),
-    "channel_price_status": ("<b>/channel_price_status</b>\n\nList all active custom price overrides.\n\n"
-                             "<b>Example:</b> <code>/channel_price_status</code>"),
-    "promo_set":  ("<b>/promo_set &lt;ch_id&gt; &lt;segment&gt; &lt;price&gt;</b>\n\nActivate a promotional price (highest priority — overrides custom &amp; default).\n\n"
-                   "<b>Example:</b> <code>/promo_set 1 unpaid 99</code>"),
-    "promo_clear":("<b>/promo_clear &lt;ch_id&gt; &lt;segment&gt;</b>\n\nDeactivate promotion — price reverts to custom or default.\n\n"
-                   "<b>Example:</b> <code>/promo_clear 1 unpaid</code>"),
-    "promo_status":("<b>/promo_status</b>\n\nList all currently active promotions.\n\n"
-                    "<b>Example:</b> <code>/promo_status</code>"),
-    "promo_send": ("<b>/promo_send &lt;ch_id&gt; &lt;segment&gt; CONFIRM</b>\n\nBroadcast the active promo price to all users in that segment.\n\n"
-                   "<b>Example:</b> <code>/promo_send 1 unpaid CONFIRM</code>"),
-    "promo_personal": ("<b>/promo_personal &lt;user_id&gt; &lt;ch_id&gt; &lt;price&gt;</b>\n\nSend a one-off personal offer to a specific user.\n\n"
-                       "<b>Example:</b> <code>/promo_personal 123456789 1 79</code>"),
-    "offer_tier": ("<b>/offer_tier &lt;segment&gt; &lt;ch_id&gt; &lt;price&gt; CONFIRM</b>\n\nBulk-send an offer to every user in a segment.\n\n"
-                   "<b>Segments:</b> unpaid, T1, T1,T2, all\n\n"
-                   "<b>Example:</b> <code>/offer_tier unpaid 1 150 CONFIRM</code>"),
-    "offer_user": ("<b>/offer_user &lt;user_id&gt; &lt;ch_id&gt; &lt;price&gt;</b>\n\nSend a targeted offer to one specific user.\n\n"
-                   "<b>Example:</b> <code>/offer_user 123456789 1 120</code>"),
-    "unpaid":     ("<b>/unpaid</b>\n\nList all users segmented by tier, with prominent IDs. Also sends a CSV for analysis.\n\n"
-                   "<b>Example:</b> <code>/unpaid</code>"),
-    "fallback_toggle": ("<b>/fallback_toggle &lt;on|off|status&gt;</b>\n\nEnable or disable the '⭐⭐ START-₹9 ⭐⭐' button shown to unpaid users on /start.\n\n"
-                        "<b>Example:</b> <code>/fallback_toggle off</code>"),
-    "special_offers_toggle": ("<b>/special_offers_toggle &lt;on|off|status&gt;</b>\n\nEnable or disable all promotion/offer commands globally.\n\n"
-                              "<b>Example:</b> <code>/special_offers_toggle on</code>"),
-    "backup":     ("<b>/backup</b>\n\nSend the live database file to you as a Telegram document (instant snapshot).\n\n"
-                   "<b>Example:</b> <code>/backup</code>"),
-    "restore":    ("<b>/restore</b>\n\nReply to a <code>.db</code> backup file with this command to restore from it.\n\n"
-                   "<b>Example:</b> Reply to a .db file → <code>/restore</code>"),
-    "import_csv": ("<b>/import_csv</b>\n\nSend a <code>master_summary.csv</code> file (reply with the file) to import purchase records into the DB.\n\n"
-                   "<b>Example:</b> Send CSV → <code>/import_csv</code>"),
-    "logs":       ("<b>/logs &lt;user_id&gt;</b>\n\nShow the last 50 logged inputs from a user (text, UPI names, screenshots).\n\n"
-                   "<b>Example:</b> <code>/logs 123456789</code>"),
-    "bulk_ids":   ("<b>/bulk_ids &lt;segment&gt;</b>\n\nGet a comma-separated list of user IDs for a segment — ready to paste into /bulk_promo_users.\n\n"
-                   "<b>Segments:</b> unpaid, T1, T1,T2, all\n\n"
-                   "<b>Example:</b> <code>/bulk_ids unpaid</code>"),
-    "bulk_promo_users": ("<b>/bulk_promo_users &lt;ids&gt; &lt;ch_id&gt; &lt;price&gt; CONFIRM</b>\n\nSend a promotion to a comma-separated list of user IDs.\n\n"
-                         "<b>Example:</b> <code>/bulk_promo_users 123456,789123 1 99 CONFIRM</code>"),
+_HELP_DETAILS = {
+    "stats":     ("<b>/stats</b>\n\nOverall bot totals.\n\n"
+                  "Shows total users, approved revenue, and purchase count per status "
+                  "(started / verifying / approved / rejected).\n\n"
+                  "<b>Example:</b> <code>/stats</code>"),
+    "pending":   ("<b>/pending</b>\n\nList all purchases awaiting your action.\n\n"
+                  "Shows purchases with status <i>verifying</i> or <i>screenshot_requested</i> — "
+                  "name, UPI, amount, and a direct chat link.\n\n"
+                  "<b>Example:</b> <code>/pending</code>"),
+    "summary":   ("<b>/summary</b>\n\nYesterday's daily report + CSV attachment.\n\n"
+                  "Shows new users, attempts, approvals, rejections, revenue. "
+                  "CSV has every transaction for that day.\n\n"
+                  "<b>Example:</b> <code>/summary</code>\n"
+                  "Optional date: <code>/summary 2025-06-01</code>"),
+    "listusers": ("<b>/listusers</b>\n\nLast 30 registered users with quick stats.\n\n"
+                  "Shows name, username, ID, approved purchase count, revenue. "
+                  "Tap a name to open their chat.\n\n"
+                  "<b>Example:</b> <code>/listusers</code>"),
+    "find":      ("<b>/find &lt;text&gt;</b>\n\nSearch users by name or username.\n\n"
+                  "Returns up to 20 matches with direct chat links.\n\n"
+                  "<b>Example:</b> <code>/find Sakshi</code>"),
+    "whoami":    ("<b>/whoami [user_id]</b>\n\nFull DB snapshot for a user.\n\n"
+                  "Shows profile info, all purchase records, statuses, and tracked message IDs. "
+                  "Omit the ID to inspect your own account.\n\n"
+                  "<b>Example:</b> <code>/whoami 123456789</code>"),
+    "wipe":      ("<b>/wipe &lt;user_id&gt;</b>\n\nDelete all bot messages in user's chat. "
+                  "Purchase records are kept — user stays recognised as paid on next /start.\n\n"
+                  "<b>Example:</b> <code>/wipe 123456789</code>"),
+    "reset":     ("<b>/reset &lt;user_id&gt;</b>\n\nNuclear reset: deletes bot messages AND all "
+                  "purchase records. User starts completely fresh as if brand new.\n\n"
+                  "<b>Example:</b> <code>/reset 123456789</code>"),
+    "resetme":   ("<b>/resetme</b>\n\nReset your own admin account. Useful for testing the full "
+                  "user flow without affecting real users.\n\n"
+                  "<b>Example:</b> <code>/resetme</code>"),
+    "wipeall":   ("<b>/wipeall YES</b>\n\nWipe bot messages for every user in the DB. "
+                  "Purchase history is preserved. Requires the YES argument as confirmation.\n\n"
+                  "<b>Example:</b> <code>/wipeall YES</code>"),
+    "resetall":  ("<b>/resetall DELETE-EVERYTHING</b>\n\nNuclear reset for ALL users — deletes "
+                  "bot messages AND all purchase records for everyone. Irreversible.\n\n"
+                  "<b>Example:</b> <code>/resetall DELETE-EVERYTHING</code>"),
+    "broadcast": ("<b>/broadcast &lt;message&gt;</b>\n\nSend an announcement to every user in the DB. "
+                  "Supports HTML formatting. Reports sent/failed counts.\n\n"
+                  "<b>Example:</b> <code>/broadcast 🎉 New channel added! Check /start</code>"),
+    "msg":       ("<b>/msg &lt;user_id&gt; [message]</b>\n\nSend a custom message to one specific user. "
+                  "Omit the message text to get a tap-to-open chat link instead.\n\n"
+                  "<b>Example:</b> <code>/msg 123456789 Your payment is confirmed!</code>"),
+    "away":      ("<b>/away &lt;message&gt;</b>\n\nSet an away notice shown to users after they submit "
+                  "payment proof. Auto-clears after 30 s on the user's side, and instantly on "
+                  "approve / reject / wipe / reset.\n\n"
+                  "<b>Example:</b> <code>/away Back in 2 hours!</code>\n"
+                  "Disable: <code>/away off</code>"),
+    "block":     ("<b>/block &lt;user_id&gt; [reason]</b>\n\nBlock a user — all their interactions "
+                  "are silently ignored by the bot.\n\n"
+                  "<b>Example:</b> <code>/block 123456789 repeated fake screenshots</code>"),
+    "unblock":   ("<b>/unblock &lt;user_id&gt;</b>\n\nRemove a block so the user can interact "
+                  "with the bot again.\n\n"
+                  "<b>Example:</b> <code>/unblock 123456789</code>"),
+    "backup":    ("<b>/backup</b>\n\nSend the live database file to you as a Telegram document. "
+                  "Instant snapshot of the current state.\n\n"
+                  "<b>Example:</b> <code>/backup</code>"),
+    "restore":   ("<b>/restore</b>\n\nReply to a <code>.db</code> backup file with this command "
+                  "to restore the database from it.\n\n"
+                  "<b>Example:</b> Reply to a .db file → <code>/restore</code>"),
+    "import_csv":("<b>/import_csv</b>\n\nUpload a <code>master_summary.csv</code> file to import "
+                  "purchase records into the database.\n\n"
+                  "<b>Example:</b> Send CSV file → <code>/import_csv</code>"),
+    "logs":      ("<b>/logs &lt;user_id&gt;</b>\n\nShow the last 50 logged inputs from a user "
+                  "(text messages, UPI names, screenshots).\n\n"
+                  "<b>Example:</b> <code>/logs 123456789</code>"),
+    "msg_adm":   ("<b>/msg &lt;user_id&gt;</b>\n\nOpen a direct chat link for a user without "
+                  "sending a message.\n\n"
+                  "<b>Example:</b> <code>/msg 123456789</code>"),
 }
 
-# Ordered sections for the summary menu
 _HELP_SECTIONS = [
-    ("📊 Stats & Reports",     ["stats","pending","summary","listusers","find","whoami"]),
-    ("🧹 Cleanup — Single",    ["wipe","reset","resetme"]),
-    ("☢️ Cleanup — ALL",       ["wipeall","resetall"]),
-    ("📢 Communication",       ["broadcast","msg","away"]),
-    ("🚫 User Control",        ["block","unblock"]),
-    ("📦 Channel & Pricing",   ["show_channels","show_channels_status","channel_price","channel_price_status"]),
-    ("🎁 Promotions",          ["promo_set","promo_clear","promo_status","promo_send","promo_personal",
-                                "offer_tier","offer_user","unpaid"]),
-    ("🔧 Toggles",             ["fallback_toggle","special_offers_toggle"]),
-    ("💾 DB Backup",           ["backup","restore","import_csv"]),
-    ("📋 Diagnostics",         ["logs","bulk_ids","bulk_promo_users"]),
+    ("📊 Stats & Reports",  ["stats", "pending", "summary", "listusers", "find", "whoami"]),
+    ("🧹 Cleanup (single)", ["wipe", "reset", "resetme"]),
+    ("☢️ Cleanup (ALL)",    ["wipeall", "resetall"]),
+    ("📢 Communication",    ["broadcast", "msg", "away", "block", "unblock"]),
+    ("💾 DB Backup",        ["backup", "restore", "import_csv"]),
+    ("📋 Diagnostics",      ["logs"]),
 ]
 
+
 async def cmd_help(update, context):
-    """Admin: /help — show command summary with tappable buttons for detail."""
+    """Admin: /help — compact summary with tappable buttons for per-command detail."""
     if update.effective_user.id != ADMIN_ID:
         return
 
-    text = "🛠 <b>Admin Commands</b>\n<i>Tap any command for usage &amp; example.</i>\n"
+    lines = ["🛠 <b>Admin Commands</b>\n<i>Tap a button below for usage &amp; example.</i>"]
     rows = []
-    for section_name, cmds in _HELP_SECTIONS:
-        text += f"\n<b>{section_name}</b>\n"
+    for section, cmds in _HELP_SECTIONS:
+        lines.append(f"\n<b>{section}</b>")
         for cmd in cmds:
-            text += f"  /{cmd}\n"
-        # One row of buttons per section (up to 4 per row)
+            lines.append(f"  /{cmd}")
         btn_row = []
         for cmd in cmds:
-            btn_row.append(InlineKeyboardButton(f"/{cmd}", callback_data=f"help:{cmd}"))
+            btn_row.append(InlineKeyboardButton(f"/{cmd}", callback_data=f"help_d:{cmd}"))
             if len(btn_row) == 4:
                 rows.append(btn_row)
                 btn_row = []
         if btn_row:
             rows.append(btn_row)
 
-    await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(rows))
+    await update.message.reply_html(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def cb_help_detail(update, context):
-    """Show detailed usage for a single command when tapped in /help."""
+    """Edit /help message in-place to show detail for tapped command."""
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
         await q.answer()
         return
+    await q.answer()
+
     cmd = q.data.split(":", 1)[1]
 
     if cmd == "__back__":
-        # Re-build and show the summary list inline
-        text = "🛠 <b>Admin Commands</b>\n<i>Tap any command for usage &amp; example.</i>\n"
+        # Rebuild summary
+        lines = ["🛠 <b>Admin Commands</b>\n<i>Tap a button below for usage &amp; example.</i>"]
         rows = []
-        for section_name, cmds in _HELP_SECTIONS:
-            text += f"\n<b>{section_name}</b>\n"
+        for section, cmds in _HELP_SECTIONS:
+            lines.append(f"\n<b>{section}</b>")
             for c in cmds:
-                text += f"  /{c}\n"
+                lines.append(f"  /{c}")
             btn_row = []
             for c in cmds:
-                btn_row.append(InlineKeyboardButton(f"/{c}", callback_data=f"help:{c}"))
+                btn_row.append(InlineKeyboardButton(f"/{c}", callback_data=f"help_d:{c}"))
                 if len(btn_row) == 4:
                     rows.append(btn_row)
                     btn_row = []
             if btn_row:
                 rows.append(btn_row)
         try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML,
+            await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
-            log.debug(f"cb_help_detail back edit failed: {e}")
-        await q.answer()
+            log.debug(f"cb_help_detail back failed: {e}")
         return
 
-    detail = HELP_DETAILS.get(cmd, f"No detail available for <code>/{cmd}</code>.")
+    detail = _HELP_DETAILS.get(cmd, f"No detail found for <code>/{cmd}</code>.")
     back_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ Back to /help", callback_data="help:__back__")
+        InlineKeyboardButton("⬅️ Back", callback_data="help_d:__back__")
     ]])
     try:
         await q.edit_message_text(detail, parse_mode=ParseMode.HTML, reply_markup=back_kb)
     except Exception as e:
-        log.debug(f"cb_help_detail edit failed: {e}")
-    await q.answer()
+        log.debug(f"cb_help_detail failed: {e}")
 
 
 async def cmd_logs(update, context):
@@ -2484,7 +2465,7 @@ async def cmd_msg(update, context):
             parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
-        # Track so wipe/reset can delete it
+        # Track so wipe / reset / resetall / wipeall will delete it
         track_msg(user_id, sent_m.message_id)
         await update.message.reply_html(f"✅ Message sent to user {user_id}")
     except Exception as e:
@@ -4273,7 +4254,7 @@ def main():
     app.add_handler(CommandHandler("listusers", cmd_listusers))
     app.add_handler(CommandHandler("find",      cmd_find))
     app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CallbackQueryHandler(cb_help_detail, pattern=r"^help:"))
+    app.add_handler(CallbackQueryHandler(cb_help_detail, pattern=r"^help_d:"))
     app.add_handler(CommandHandler("logs",      cmd_logs))
     app.add_handler(CommandHandler("msg",       cmd_msg))
     app.add_handler(CommandHandler("block",     cmd_block))
