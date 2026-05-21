@@ -88,10 +88,7 @@ def _parse_bundle(price: int, s: str):
 
 BUNDLES = {}  # {price: bundle_info}
 bundle_config = [
-    (30, "BUNDLE_1"),
-    (59, "BUNDLE_5"),
-    (79, "BUNDLE_10"),
-    (99, "BUNDLE_15"),
+    (9, "BUNDLE_1"),
 ]
 for price, env_key in bundle_config:
     b = _parse_bundle(price, os.getenv(env_key, ""))
@@ -626,6 +623,21 @@ def schedule_auto_delete(context, chat_id, message_id, delay_seconds=30):
         name=f"autodel_{chat_id}_{message_id}",
     )
 
+async def delete_away_message(context, user_id: int):
+    """Instantly delete the away message sent to a user (if it still exists)."""
+    mid_str = get_admin_setting(f"away_msg_id_{user_id}", "")
+    if not mid_str:
+        return
+    try:
+        mid = int(mid_str)
+        await context.bot.delete_message(chat_id=user_id, message_id=mid)
+    except Exception as e:
+        log.debug(f"delete_away_message failed for {user_id}: {e}")
+    finally:
+        # Clear the stored ID regardless of whether delete succeeded
+        set_admin_setting(f"away_msg_id_{user_id}", "")
+
+
 async def auto_wipe_user_chat(context):
     """JobQueue callback: wipe ALL bot MESSAGES for a user after delay.
     Called automatically X minutes after approval/rejection.
@@ -750,6 +762,9 @@ async def full_reset(context, user_id: int):
             log.debug(f"full_reset delete {mid} failed: {e}")
 
     log.info(f"full_reset: deleted {deleted} messages for user {user_id}")
+
+    # Remove any pending away message immediately
+    await delete_away_message(context, user_id)
 
     # Wipe all DB state
     reset_user_data(user_id)
@@ -887,7 +902,7 @@ def build_multi_tier_keyboard():
     # Add bundle offers button if configured
     if os.getenv("BUNDLE_1"):
         keyboard.append([
-            InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")
+            InlineKeyboardButton("⭐⭐ START-₹9 ⭐⭐", callback_data="show_bundles")
         ])
     
     # Add back button
@@ -901,7 +916,7 @@ def build_single_tier_keyboard():
     """Build default single-tier keyboard (₹99 entry point)."""
     keyboard = [
         [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99", callback_data="buy_tier:1")],
-        [InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")],
+        [InlineKeyboardButton("⭐⭐ START-₹9 ⭐⭐", callback_data="show_bundles")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -1013,7 +1028,7 @@ async def cmd_start(update, context):
         # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
             rows.append([InlineKeyboardButton(
-                "📦 See Budget Bundles", callback_data="fallback_menu"
+                "⭐⭐ START-₹9 ⭐⭐", callback_data="fallback_menu"
             )])
 
     else:
@@ -1100,23 +1115,17 @@ async def cb_fallback_menu(update, context):
     
     # Bundle options: (display_name, price_rupees)
     bundles = [
-        ("1 Channel", 30),
-        ("5 Channels", 59),
-        ("10 Channels", 79),
-        ("15 Channels", 99),
+        ("1 Channel", 9),
     ]
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
+        [InlineKeyboardButton(f"⭐ {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
         for name, price in bundles
     ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
     
-    text = (f"<b>💰 Budget Bundles</b>\n\n"
+    text = (f"<b>💰 100% TRUSTED</b>\n\n"
             f"Get started with affordable options:\n\n"
-            f"• <b>1 Channel</b> — ₹30\n"
-            f"• <b>5 Channels</b> — ₹59\n"
-            f"• <b>10 Channels</b> — ₹79\n"
-            f"• <b>15 Channels</b> — ₹99\n\n"
+            f"• <b>1 Channel</b> — ₹9\n"
             f"<i>Tap any bundle to proceed with payment</i>")
     
     try:
@@ -1170,7 +1179,7 @@ async def cb_buy_bundle(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅", callback_data=f"upi:start:{pid}")
     ]])
     
     with open(qr_path, "rb") as fh:
@@ -1305,7 +1314,7 @@ async def cb_buy(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅", callback_data=f"upi:start:{pid}")
     ]])
 
     with open(qr_path, "rb") as fh:
@@ -1364,7 +1373,7 @@ async def send_upi_prompt(context):
         f"✅ Paid?"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid",
+        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅",
                              callback_data=f"upi:start:{pid}")
     ]])
     try:
@@ -1524,12 +1533,17 @@ async def on_text_message(update, context):
     away_msg = get_admin_setting("away_message", "")
     if away_msg:
         try:
-            await context.bot.send_message(
+            away_m = await context.bot.send_message(
                 chat_id=user.id,
                 text=f"⏰ <b>Admin is currently away</b>\n\n{away_msg}",
                 parse_mode=ParseMode.HTML,
                 disable_notification=True,
             )
+            track_msg(user.id, away_m.message_id)
+            # Store so approval/rejection/reset can delete it immediately
+            set_admin_setting(f"away_msg_id_{user.id}", str(away_m.message_id))
+            # Auto-delete after 30 seconds if not already removed
+            schedule_auto_delete(context, user.id, away_m.message_id, delay_seconds=30)
         except Exception:
             pass
 
@@ -1642,6 +1656,8 @@ async def cb_admin(update, context):
                 show_alert=False)
         except Exception:
             pass
+        # Remove any pending away message immediately
+        await delete_away_message(context, target_user_id)
         await _edit_admin_card(q,
             extra=f"\n\n🧹 <b>WIPED</b> {datetime.now(TZ):%d-%b %H:%M}")
         return
@@ -1790,7 +1806,7 @@ async def cb_admin(update, context):
                     )])
                     if is_fallback_enabled():
                         rows.append([InlineKeyboardButton(
-                            "📦 See Budget Bundles", callback_data="fallback_menu"
+                            "⭐⭐ START-₹9 ⭐⭐", callback_data="fallback_menu"
                         )])
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
@@ -1844,6 +1860,9 @@ async def cb_admin(update, context):
         # When user returns later, chat will look fresh.
         schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
 
+        # Remove any pending away message from the user's chat immediately
+        await delete_away_message(context, user_id)
+
         # Auto-backup DB right after approval — captures purchase records
         # immediately, so a Railway redeploy won't lose this user.
         await event_backup(context)
@@ -1853,31 +1872,56 @@ async def cb_admin(update, context):
                         rejected_at=datetime.utcnow().isoformat())
 
         # Build keyboard for rejection. Logic:
+        #   - If rejected purchase was a bundle → show retry button for that exact bundle
         #   - Owned channels → ✅ Join button
-        #   - Tier 1 not owned → only show Tier 1 retry button (others gated)
+        #   - The rejected channel → 🔁 Try Again (pack-specific label + price)
+        #   - Tier 1 not owned + rejected pack was higher tier → show only Tier 1 retry
         #   - Tier 1 owned → show all unowned tiers as 🔒 buttons
         owned_now = get_owned_channel_ids(user_id)
         owns_tier1 = (CHANNELS and CHANNELS[0]["id"] in owned_now)
         kb_rows = []
-        for c in CHANNELS:
-            if c["id"] in owned_now:
-                # Already owned → green tick + Join URL
+
+        if p["channel_id"] == 0:
+            # BUNDLE rejection — show retry for that exact bundle
+            bundle_price = p["amount"]
+            if bundle_price in BUNDLES:
+                bundle = BUNDLES[bundle_price]
                 kb_rows.append([InlineKeyboardButton(
-                    f"✅ {c['name']} — Join", url=c["link"]
+                    f"🔁 Try Again — {bundle['name']} ₹{bundle_price}",
+                    callback_data=f"buy_bundle:{bundle_price}",
                 )])
-            elif c["id"] == CHANNELS[0]["id"]:
-                # Tier 1 — always show the retry button
+            else:
                 kb_rows.append([InlineKeyboardButton(
-                    f"🔁 Try Again — {c['name']} ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
+                    f"🔁 Try Again — Bundle ₹{bundle_price}",
+                    callback_data=f"buy_bundle:{bundle_price}",
                 )])
-            elif owns_tier1:
-                # Higher tier, user has Tier 1 → show as buyable
-                kb_rows.append([InlineKeyboardButton(
-                    f"🔒 {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
-                )])
-            # else: higher tier, user lacks Tier 1 → hide it (would just block)
+        else:
+            # CHANNEL rejection
+            for c in CHANNELS:
+                if c["id"] in owned_now:
+                    # Already owned → green tick + Join URL
+                    kb_rows.append([InlineKeyboardButton(
+                        f"✅ {c['name']} — Join", url=c["link"]
+                    )])
+                elif c["id"] == p["channel_id"]:
+                    # The rejected pack → show pack-specific retry button
+                    kb_rows.append([InlineKeyboardButton(
+                        f"🔁 Try Again — {c['name']} ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                elif c["id"] == CHANNELS[0]["id"] and not owns_tier1:
+                    # Tier 1 not owned and this isn't the rejected pack → show Tier 1 retry
+                    kb_rows.append([InlineKeyboardButton(
+                        f"🔁 Try Again — {c['name']} ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                elif owns_tier1:
+                    # Higher tier, user has Tier 1 → show as buyable
+                    kb_rows.append([InlineKeyboardButton(
+                        f"🔒 {c['name']} — ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                # else: higher tier, user lacks Tier 1 → hide it (would just block)
         reject_kb = InlineKeyboardMarkup(kb_rows)
 
         if p.get("main_msg_id"):
@@ -1896,6 +1940,9 @@ async def cb_admin(update, context):
 
         # Auto-wipe user chat after delay so it looks fresh next time
         schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
+
+        # Remove any pending away message from the user's chat immediately
+        await delete_away_message(context, user_id)
 
         # Auto-backup DB right after rejection — captures the audit trail.
         await event_backup(context)
@@ -2228,157 +2275,74 @@ async def cmd_find(update, context):
     await update.message.reply_html(text, disable_web_page_preview=True)
 
 
-_HELP_DETAILS = {
-    "stats":     ("<b>/stats</b>\n\nOverall bot totals.\n\n"
-                  "Shows total users, approved revenue, and purchase count per status "
-                  "(started / verifying / approved / rejected).\n\n"
-                  "<b>Example:</b> <code>/stats</code>"),
-    "pending":   ("<b>/pending</b>\n\nList all purchases awaiting your action.\n\n"
-                  "Shows purchases with status <i>verifying</i> or <i>screenshot_requested</i> — "
-                  "name, UPI, amount, and a direct chat link.\n\n"
-                  "<b>Example:</b> <code>/pending</code>"),
-    "summary":   ("<b>/summary</b>\n\nYesterday's daily report + CSV attachment.\n\n"
-                  "Shows new users, attempts, approvals, rejections, revenue. "
-                  "CSV has every transaction for that day.\n\n"
-                  "<b>Example:</b> <code>/summary</code>\n"
-                  "Optional date: <code>/summary 2025-06-01</code>"),
-    "listusers": ("<b>/listusers</b>\n\nLast 30 registered users with quick stats.\n\n"
-                  "Shows name, username, ID, approved purchase count, revenue. "
-                  "Tap a name to open their chat.\n\n"
-                  "<b>Example:</b> <code>/listusers</code>"),
-    "find":      ("<b>/find &lt;text&gt;</b>\n\nSearch users by name or username.\n\n"
-                  "Returns up to 20 matches with direct chat links.\n\n"
-                  "<b>Example:</b> <code>/find Sakshi</code>"),
-    "whoami":    ("<b>/whoami [user_id]</b>\n\nFull DB snapshot for a user.\n\n"
-                  "Shows profile info, all purchase records, statuses, and tracked message IDs. "
-                  "Omit the ID to inspect your own account.\n\n"
-                  "<b>Example:</b> <code>/whoami 123456789</code>"),
-    "wipe":      ("<b>/wipe &lt;user_id&gt;</b>\n\nDelete all bot messages in user's chat. "
-                  "Purchase records are kept — user stays recognised as paid on next /start.\n\n"
-                  "<b>Example:</b> <code>/wipe 123456789</code>"),
-    "reset":     ("<b>/reset &lt;user_id&gt;</b>\n\nNuclear reset: deletes bot messages AND all "
-                  "purchase records. User starts completely fresh as if brand new.\n\n"
-                  "<b>Example:</b> <code>/reset 123456789</code>"),
-    "resetme":   ("<b>/resetme</b>\n\nReset your own admin account. Useful for testing the full "
-                  "user flow without affecting real users.\n\n"
-                  "<b>Example:</b> <code>/resetme</code>"),
-    "wipeall":   ("<b>/wipeall YES</b>\n\nWipe bot messages for every user in the DB. "
-                  "Purchase history is preserved. Requires the YES argument as confirmation.\n\n"
-                  "<b>Example:</b> <code>/wipeall YES</code>"),
-    "resetall":  ("<b>/resetall DELETE-EVERYTHING</b>\n\nNuclear reset for ALL users — deletes "
-                  "bot messages AND all purchase records for everyone. Irreversible.\n\n"
-                  "<b>Example:</b> <code>/resetall DELETE-EVERYTHING</code>"),
-    "broadcast": ("<b>/broadcast &lt;message&gt;</b>\n\nSend an announcement to every user in the DB. "
-                  "Supports HTML formatting. Reports sent/failed counts.\n\n"
-                  "<b>Example:</b> <code>/broadcast 🎉 New channel added! Check /start</code>"),
-    "msg":       ("<b>/msg &lt;user_id&gt; [message]</b>\n\nSend a custom message to one specific user. "
-                  "Omit the message text to get a tap-to-open chat link instead.\n\n"
-                  "<b>Example:</b> <code>/msg 123456789 Your payment is confirmed!</code>"),
-    "away":      ("<b>/away &lt;message&gt;</b>\n\nSet an away notice shown to users after they submit "
-                  "payment proof. Auto-clears after 30 s on the user's side, and instantly on "
-                  "approve / reject / wipe / reset.\n\n"
-                  "<b>Example:</b> <code>/away Back in 2 hours!</code>\n"
-                  "Disable: <code>/away off</code>"),
-    "block":     ("<b>/block &lt;user_id&gt; [reason]</b>\n\nBlock a user — all their interactions "
-                  "are silently ignored by the bot.\n\n"
-                  "<b>Example:</b> <code>/block 123456789 repeated fake screenshots</code>"),
-    "unblock":   ("<b>/unblock &lt;user_id&gt;</b>\n\nRemove a block so the user can interact "
-                  "with the bot again.\n\n"
-                  "<b>Example:</b> <code>/unblock 123456789</code>"),
-    "backup":    ("<b>/backup</b>\n\nSend the live database file to you as a Telegram document. "
-                  "Instant snapshot of the current state.\n\n"
-                  "<b>Example:</b> <code>/backup</code>"),
-    "restore":   ("<b>/restore</b>\n\nReply to a <code>.db</code> backup file with this command "
-                  "to restore the database from it.\n\n"
-                  "<b>Example:</b> Reply to a .db file → <code>/restore</code>"),
-    "import_csv":("<b>/import_csv</b>\n\nUpload a <code>master_summary.csv</code> file to import "
-                  "purchase records into the database.\n\n"
-                  "<b>Example:</b> Send CSV file → <code>/import_csv</code>"),
-    "logs":      ("<b>/logs &lt;user_id&gt;</b>\n\nShow the last 50 logged inputs from a user "
-                  "(text messages, UPI names, screenshots).\n\n"
-                  "<b>Example:</b> <code>/logs 123456789</code>"),
-    "msg_adm":   ("<b>/msg &lt;user_id&gt;</b>\n\nOpen a direct chat link for a user without "
-                  "sending a message.\n\n"
-                  "<b>Example:</b> <code>/msg 123456789</code>"),
-}
-
-_HELP_SECTIONS = [
-    ("📊 Stats & Reports",  ["stats", "pending", "summary", "listusers", "find", "whoami"]),
-    ("🧹 Cleanup (single)", ["wipe", "reset", "resetme"]),
-    ("☢️ Cleanup (ALL)",    ["wipeall", "resetall"]),
-    ("📢 Communication",    ["broadcast", "msg", "away", "block", "unblock"]),
-    ("💾 DB Backup",        ["backup", "restore", "import_csv"]),
-    ("📋 Diagnostics",      ["logs"]),
-]
-
-
 async def cmd_help(update, context):
-    """Admin: /help — compact summary with tappable buttons for per-command detail."""
+    """Admin: /help — show all admin commands."""
     if update.effective_user.id != ADMIN_ID:
         return
+    text = (
+        "🛠 <b>Admin Commands</b>\n\n"
 
-    lines = ["🛠 <b>Admin Commands</b>\n<i>Tap a button below for usage &amp; example.</i>"]
-    rows = []
-    for section, cmds in _HELP_SECTIONS:
-        lines.append(f"\n<b>{section}</b>")
-        for cmd in cmds:
-            lines.append(f"  /{cmd}")
-        btn_row = []
-        for cmd in cmds:
-            btn_row.append(InlineKeyboardButton(f"/{cmd}", callback_data=f"help_d:{cmd}"))
-            if len(btn_row) == 4:
-                rows.append(btn_row)
-                btn_row = []
-        if btn_row:
-            rows.append(btn_row)
+        "<b>📊 Stats &amp; Reports</b>\n"
+        "/stats — Overall totals: users, revenue, and purchase counts grouped by status (started / verifying / approved / rejected).\n"
+        "/pending — Lists all purchases currently awaiting your approval (status: verifying or screenshot_requested). Shows name, UPI, amount, and a direct chat link.\n"
+        "/summary — Sends yesterday's daily summary (new users, attempts, approvals, rejections, revenue) plus a CSV attachment with every transaction for that day. Optionally pass a date: <code>/summary 2025-06-01</code>\n"
+        "/listusers — Last 30 registered users with their approved purchase count and total revenue. Tap a name to open their chat.\n"
+        "/find &lt;text&gt; — Search users by first name, last name, or username. Returns up to 20 matches with direct chat links.\n"
+        "/whoami [user_id] — Full DB snapshot for a user: profile info, all purchase records, statuses, and tracked message IDs. Omit the ID to inspect your own account.\n\n"
 
-    await update.message.reply_html(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(rows),
+        "<b>🧹 Cleanup — Single User</b>\n"
+        "/wipe &lt;user_id&gt; — Deletes all bot messages in that user's chat and clears message tracking. Purchase records are kept, so the user is still recognised as paid on their next /start.\n"
+        "/reset &lt;user_id&gt; — Nuclear reset: deletes bot messages AND all purchase records for that user. They start completely fresh as if they never used the bot.\n"
+        "/resetme — Resets your own account (useful for testing the user flow as admin).\n\n"
+
+        "<b>☢️ Cleanup — ALL Users</b>\n"
+        "/wipeall YES — Wipes bot chat messages for every user in the DB. Purchase history is preserved. Requires the YES confirmation argument.\n"
+        "/resetall DELETE-EVERYTHING — Deletes bot messages AND all purchase records for every user. Irreversible. Requires the exact phrase as the argument.\n\n"
+
+        "<b>📢 Communication</b>\n"
+        "/broadcast &lt;message&gt; — Sends an announcement to every user in the DB. Supports HTML formatting. Reports sent/failed counts.\n"
+        "/msg &lt;user_id&gt; &lt;message&gt; — Sends a custom message to a specific user. Omit the message text to get a tap-to-open chat link instead.\n"
+        "/away &lt;message&gt; — Sets an away notice shown to users after they submit payment proof. Clears automatically after 30 s on the user's side. Use <code>/away off</code> to disable immediately.\n\n"
+
+        "<b>🚫 User Control</b>\n"
+        "/block &lt;user_id&gt; [reason] — Blocks a user. Blocked users are silently ignored by the bot (no response to any interaction).\n"
+        "/unblock &lt;user_id&gt; — Removes a block, allowing the user to interact with the bot again.\n\n"
+
+        "<b>⭐ Channel &amp; Pricing Control</b>\n"
+        "/show_channels &lt;ch_id&gt; &lt;segment&gt; &lt;1|0&gt; — Show or hide a channel for a user segment (all, unpaid, T1, T1,T2 …).\n"
+        "/show_channels_status — Lists all current channel visibility rules.\n"
+        "/channel_price &lt;ch_id&gt; &lt;segment&gt; &lt;price&gt; — Override the price of a channel for a specific segment. Use <code>default</code> as price to remove override.\n"
+        "/channel_price_status — Shows all active custom price overrides.\n\n"
+
+        "<b>🎁 Promotions</b>\n"
+        "/promo_set &lt;ch_id&gt; &lt;segment&gt; &lt;price&gt; — Activate a promotional price for a channel + segment combination.\n"
+        "/promo_clear &lt;ch_id&gt; &lt;segment&gt; — Deactivate the promotion for that channel + segment.\n"
+        "/promo_status — Lists all currently active promotions.\n"
+        "/promo_send &lt;ch_id&gt; &lt;segment&gt; — Broadcasts the promo price to all users in that segment.\n"
+        "/promo_personal &lt;user_id&gt; &lt;ch_id&gt; &lt;price&gt; — Sends a one-off personal offer to a specific user.\n"
+        "/offer_tier &lt;segment&gt; &lt;ch_id&gt; &lt;price&gt; CONFIRM — Bulk-sends an offer to every user in a segment. Requires CONFIRM argument as a safeguard.\n"
+        "/offer_user &lt;user_id&gt; &lt;ch_id&gt; &lt;price&gt; — Sends a targeted offer to one user.\n"
+        "/unpaid — Lists users who have never completed a purchase (useful for re-engagement campaigns).\n\n"
+
+        "<b>🔧 Feature Toggles</b>\n"
+        "/fallback_toggle &lt;on|off|status&gt; — Enable or disable the '⭐⭐ START-₹9 ⭐⭐' button shown to unpaid users on /start.\n"
+        "/special_offers_toggle &lt;on|off|status&gt; — Enable or disable the promotion/offer commands globally.\n\n"
+
+        "<b>💾 Database Backup</b>\n"
+        "/backup — Sends the current live database file to you as a Telegram document (instant snapshot).\n"
+        "/restore — Reply to a .db file with this command to restore the database from that file.\n"
+        "/import_csv — Use after sending a master_summary.csv file; imports purchase records from the CSV into the DB.\n\n"
+
+        "<b>📋 Diagnostics</b>\n"
+        "/logs &lt;user_id&gt; — Shows the last 50 logged messages (text inputs, UPI names, screenshots) from a user.\n"
+        "/bulk_ids — Lists all user IDs in the DB (raw list, for scripting).\n"
+        "/bulk_promo_users &lt;segment&gt; — Lists user IDs belonging to a given segment.\n\n"
+
+        "<i>Inline buttons on admin notifications:</i>\n"
+        "✅ Approve · ❌ Reject · 📸 Request Screenshot\n"
+        "🧹 Wipe (after action) · 🚨 Open User Chat (after reject)"
     )
-
-
-async def cb_help_detail(update, context):
-    """Edit /help message in-place to show detail for tapped command."""
-    q = update.callback_query
-    if q.from_user.id != ADMIN_ID:
-        await q.answer()
-        return
-    await q.answer()
-
-    cmd = q.data.split(":", 1)[1]
-
-    if cmd == "__back__":
-        # Rebuild summary
-        lines = ["🛠 <b>Admin Commands</b>\n<i>Tap a button below for usage &amp; example.</i>"]
-        rows = []
-        for section, cmds in _HELP_SECTIONS:
-            lines.append(f"\n<b>{section}</b>")
-            for c in cmds:
-                lines.append(f"  /{c}")
-            btn_row = []
-            for c in cmds:
-                btn_row.append(InlineKeyboardButton(f"/{c}", callback_data=f"help_d:{c}"))
-                if len(btn_row) == 4:
-                    rows.append(btn_row)
-                    btn_row = []
-            if btn_row:
-                rows.append(btn_row)
-        try:
-            await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML,
-                                      reply_markup=InlineKeyboardMarkup(rows))
-        except Exception as e:
-            log.debug(f"cb_help_detail back failed: {e}")
-        return
-
-    detail = _HELP_DETAILS.get(cmd, f"No detail found for <code>/{cmd}</code>.")
-    back_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ Back", callback_data="help_d:__back__")
-    ]])
-    try:
-        await q.edit_message_text(detail, parse_mode=ParseMode.HTML, reply_markup=back_kb)
-    except Exception as e:
-        log.debug(f"cb_help_detail failed: {e}")
+    await update.message.reply_html(text)
 
 
 async def cmd_logs(update, context):
@@ -2459,14 +2423,12 @@ async def cmd_msg(update, context):
     # Send message to user
     message_text = " ".join(args[1:])
     try:
-        sent_m = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=user_id,
-            text=f"📩 <b>Message from Admin</b>\n\n{message_text}",
+            text=f"📩 <b>Message from ipepsi</b>\n\n{message_text}",
             parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
-        # Track so wipe / reset / resetall / wipeall will delete it
-        track_msg(user_id, sent_m.message_id)
         await update.message.reply_html(f"✅ Message sent to user {user_id}")
     except Exception as e:
         await update.message.reply_html(f"❌ Failed to send message: {str(e)}")
@@ -2545,7 +2507,7 @@ async def cmd_away(update, context):
 async def cmd_fallback_toggle(update, context):
     """Admin: /fallback_toggle <on|off> — enable/disable fallback bundle offers
     
-    When enabled: Unpaid users see "📦 See Fallback Offers" button
+    When enabled: Unpaid users see "⭐ See Fallback Offers" button
     When disabled: Unpaid users see only primary offer (no fallback bundles)
     
     Examples:
@@ -4254,7 +4216,6 @@ def main():
     app.add_handler(CommandHandler("listusers", cmd_listusers))
     app.add_handler(CommandHandler("find",      cmd_find))
     app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CallbackQueryHandler(cb_help_detail, pattern=r"^help_d:"))
     app.add_handler(CommandHandler("logs",      cmd_logs))
     app.add_handler(CommandHandler("msg",       cmd_msg))
     app.add_handler(CommandHandler("block",     cmd_block))
