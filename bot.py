@@ -1454,11 +1454,11 @@ async def cb_proof_choice(update, context):
                         "✍️ <b>UPI NAME?</b>\n\n"
                         "Type the name on your UPI account.\n\n"
                         "Example: <b>Sakshi</b>")
-    else:  # shot
+    """else:  # shot
         update_purchase(pid, status="screenshot_requested")
         await edit_main(context, user.id, q.message.message_id,
                         "📸 <b>SEND SCREENSHOT</b>\n\n"
-                        "Send your payment success screenshot here.")
+                        "Send your payment success screenshot here.")"""
 
 
 async def on_text_message(update, context):
