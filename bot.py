@@ -1546,7 +1546,7 @@ async def on_text_message(update, context):
         try:
             away_m = await context.bot.send_message(
                 chat_id=user.id,
-                text=f"⏰ <b>Admin is currently away</b>\n\n{away_msg}",
+                text=f"⏰ <b>ipepsi is currently Down</b>\n\n{away_msg}",
                 parse_mode=ParseMode.HTML,
                 disable_notification=True,
             )
@@ -1996,7 +1996,7 @@ async def cb_admin(update, context):
         schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
 
         # Auto-backup DB right after rejection — captures the audit trail.
-        await event_backup(context)
+        #await event_backup(context)
 
     elif action == "reqss":
         update_purchase(pid, status="screenshot_requested")
@@ -2695,7 +2695,7 @@ async def cmd_msg(update, context):
     try:
         sent_m = await context.bot.send_message(
             chat_id=user_id,
-            text=f"📩 <b>Message from Admin</b>\n\n{message_text}",
+            text=f"📩 <b>Message from ipepsi</b>\n\n{message_text}",
             parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
