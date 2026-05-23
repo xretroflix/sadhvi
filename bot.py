@@ -1544,12 +1544,16 @@ async def on_text_message(update, context):
     away_msg = get_admin_setting("away_message", "")
     if away_msg:
         try:
-            await context.bot.send_message(
+            away_m = await context.bot.send_message(
                 chat_id=user.id,
                 text=f"⏰ <b>Admin is currently away</b>\n\n{away_msg}",
                 parse_mode=ParseMode.HTML,
                 disable_notification=True,
             )
+            # Track so wipe/reset deletes it
+            track_msg(user.id, away_m.message_id)
+            # Auto-delete after 30 seconds
+            schedule_auto_delete(context, user.id, away_m.message_id, delay_seconds=30)
         except Exception:
             pass
 
