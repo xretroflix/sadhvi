@@ -1418,8 +1418,6 @@ async def cb_upi_start(update, context):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Send UPI Name",
                               callback_data=f"proof:name:{pid}")],
-        """[InlineKeyboardButton("📸 Send Screenshot",
-                              callback_data=f"proof:shot:{pid}")],"""
     ])
     m = await context.bot.send_message(
         chat_id=user.id,
