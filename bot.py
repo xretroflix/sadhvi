@@ -566,6 +566,22 @@ def get_users_by_group(group: str) -> list:
         })
     return result
 
+def get_users_by_purchase_status(status: str) -> list:
+    """Get users who have purchases with given status (rejected/cancelled)
+    but do NOT have any approved purchases."""
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT u.user_id, u.first_name, u.last_name, u.username
+            FROM users u
+            JOIN purchases p ON p.user_id = u.user_id
+            WHERE p.status = ?
+            AND u.user_id NOT IN (
+                SELECT DISTINCT user_id FROM purchases WHERE status='approved'
+            )
+            ORDER BY u.user_id DESC
+        """, (status,)).fetchall()
+    return [dict(r) for r in rows]
+
 async def clear_tracked(context, user_id):
     """Delete all tracked bot messages in user's chat."""
     ids = get_tracked_msgs(user_id)
@@ -3615,7 +3631,114 @@ async def cmd_offer_user(update, context):
         await update.message.reply_html(
             f"❌ Failed to send: {e}"
         )
+async def cmd_retarget(update, context):
+    """Admin: /retarget <rejected|cancelled> <channel_id> <price> [CONFIRM]
+    
+    Send offer to users whose payments were rejected or cancelled.
+    Only targets users with NO approved purchases.
+    
+    Examples:
+    /retarget rejected 1 99 CONFIRM
+    /retarget cancelled 1 79 CONFIRM
+    /retarget all 1 89 CONFIRM   ← both rejected + cancelled
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
 
+    args = context.args or []
+    if len(args) < 3:
+        await update.message.reply_html(
+            "Usage: <code>/retarget &lt;rejected|cancelled|all&gt; &lt;channel_id&gt; &lt;price&gt; [CONFIRM]</code>\n\n"
+            "Examples:\n"
+            "<code>/retarget rejected 1 99 CONFIRM</code>\n"
+            "<code>/retarget cancelled 1 79 CONFIRM</code>\n"
+            "<code>/retarget all 1 89 CONFIRM</code>\n\n"
+            "<i>Only targets users with no approved purchases.</i>"
+        )
+        return
+
+    segment = args[0].lower()
+    try:
+        channel_id = int(args[1])
+        price = int(args[2])
+    except ValueError:
+        await update.message.reply_text("Invalid channel_id or price.")
+        return
+
+    channel = next((c for c in CHANNELS if c["id"] == channel_id), None)
+    if not channel:
+        await update.message.reply_text(f"Channel {channel_id} not found.")
+        return
+
+    # Gather target users
+    if segment == "rejected":
+        users = get_users_by_purchase_status("rejected")
+    elif segment == "cancelled":
+        users = get_users_by_purchase_status("cancelled")
+    elif segment == "all":
+        r = get_users_by_purchase_status("rejected")
+        c = get_users_by_purchase_status("cancelled")
+        # Deduplicate by user_id
+        seen = set()
+        users = []
+        for u in r + c:
+            if u["user_id"] not in seen:
+                seen.add(u["user_id"])
+                users.append(u)
+    else:
+        await update.message.reply_text("Segment must be: rejected, cancelled, or all")
+        return
+
+    if not users:
+        await update.message.reply_text(f"No unapproved users found in '{segment}' segment.")
+        return
+
+    # Preview without CONFIRM
+    if len(args) < 4 or args[3].upper() != "CONFIRM":
+        preview_names = ", ".join(
+            (u["first_name"] or f"ID {u['user_id']}") for u in users[:5]
+        )
+        await update.message.reply_html(
+            f"⚠️ About to retarget <b>{len(users)}</b> users.\n\n"
+            f"<b>Segment:</b> {segment}\n"
+            f"<b>Channel:</b> {channel['name']}\n"
+            f"<b>Price:</b> ₹{price}\n"
+            f"<b>Preview:</b> {preview_names}{'…' if len(users) > 5 else ''}\n\n"
+            f"To confirm:\n"
+            f"<code>/retarget {segment} {channel_id} {price} CONFIRM</code>"
+        )
+        return
+
+    await update.message.reply_text(f"📢 Sending to {len(users)} users…")
+
+    offer_msg = (
+        f"🔁 <b>STILL INTERESTED?</b>\n\n"
+        f"<b>{channel['name']}</b>\n"
+        f"<b>₹{price}</b>\n\n"
+        f"Give it another shot! Send /start to try again."
+    )
+
+    sent = 0
+    failed = 0
+    for u in users:
+        try:
+            m = await context.bot.send_message(
+                chat_id=u["user_id"],
+                text=offer_msg,
+                parse_mode=ParseMode.HTML,
+                disable_notification=True,
+            )
+            track_msg(u["user_id"], m.message_id)
+            log_user_message(u["user_id"], "retarget_sent", f"Ch{channel_id} ₹{price}")
+            sent += 1
+        except Exception as e:
+            log.debug(f"retarget to {u['user_id']} failed: {e}")
+            failed += 1
+
+    await update.message.reply_html(
+        f"✅ <b>Retarget complete.</b>\n"
+        f"Sent: {sent}\nFailed/blocked: {failed}"
+    )
 
 async def cmd_offer_users(update, context):
     """Admin: /offer_users <channel_id> <price> <user_id1> [user_id2] [user_id3] ...
@@ -4286,6 +4409,7 @@ def main():
     app.add_handler(CommandHandler("unpaid",      cmd_unpaid))
     app.add_handler(CommandHandler("backup",      cmd_backup))
     app.add_handler(CommandHandler("import_csv",  cmd_import_csv))
+    app.add_handler(CommandHandler("retarget", cmd_retarget))
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.ChatType.PRIVATE,
         on_csv_import_file
