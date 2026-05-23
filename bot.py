@@ -1573,11 +1573,15 @@ async def on_text_message(update, context):
 
 
 async def animate_verifying(context):
-    """Edit the verifying message with cycling dots — keeps user engaged."""
     data = context.job.data
     p = get_purchase(data["purchase_id"])
     if not p or p["status"] != "verifying":
         return  # admin already acted, stop animating
+    # Re-fetch right before API call — closes the race window where admin
+    # rejects while this coroutine is mid-flight
+    p = get_purchase(data["purchase_id"])
+    if not p or p["status"] != "verifying":
+        return
     await edit_main(context, data["user_id"], data["msg_id"],
                     f"⏳ <b>VERIFYING{data['dots']}</b>\n\n"
                     f"UPI: <b>{data['upi_name']}</b>\n\n"
@@ -1897,7 +1901,7 @@ async def cb_admin(update, context):
         update_purchase(pid, status="rejected",
                         rejected_at=datetime.utcnow().isoformat())
 
-        # Cancel all pending animation jobs for this purchase
+        # Cancel all pending animation jobs immediately
         for i in range(8):
             for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
                 job.schedule_removal()
@@ -1930,11 +1934,48 @@ async def cb_admin(update, context):
             # else: higher tier, user lacks Tier 1 → hide it (would just block)
         reject_kb = InlineKeyboardMarkup(kb_rows)
 
+        rejection_text = "❌ <b>REJECTED</b>\n\n<i>Payment not verified.</i>"
+        delivered = False
         if p.get("main_msg_id"):
-            await edit_main(context, user_id, p["main_msg_id"],
-                            "❌ <b>REJECTED</b>\n\n"
-                            "<i>Payment not verified.</i>",
-                            reply_markup=reject_kb)
+            delivered = await edit_main(
+                context, user_id, p["main_msg_id"],
+                rejection_text, reply_markup=reject_kb,
+            )
+
+        # Fallback — if edit failed (e.g. animation overwrote it), send fresh
+        if not delivered:
+            try:
+                m = await context.bot.send_message(
+                    chat_id=user_id,
+                    text=rejection_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reject_kb,
+                    protect_content=True,
+                    disable_notification=True,
+                )
+                track_msg(user_id, m.message_id)
+                update_purchase(pid, main_msg_id=m.message_id)
+                delivered = True
+            except Exception as e:
+                log.error(f"reject delivery failed: {e}")
+
+        # Re-confirm rejection 6s later — catches any in-flight animation
+        # that slipped past the cancellation and overwrote the rejection edit
+        async def reconfirm_rejection(ctx):
+            rp = get_purchase(pid)
+            if not rp or rp["status"] != "rejected":
+                return
+            if not rp.get("main_msg_id"):
+                return
+            await edit_main(ctx, user_id, rp["main_msg_id"],
+                            rejection_text, reply_markup=reject_kb)
+
+        context.job_queue.run_once(
+            reconfirm_rejection,
+            when=6,
+            name=f"reconfirm_reject_{pid}",
+        )
+        
         chat_link = f"tg://user?id={user_id}"
         await _edit_admin_card(q,
             extra=f"\n\n❌ <b>REJECTED</b> {datetime.now(TZ):%d-%b %H:%M}",
