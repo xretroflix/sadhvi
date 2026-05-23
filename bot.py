@@ -88,10 +88,7 @@ def _parse_bundle(price: int, s: str):
 
 BUNDLES = {}  # {price: bundle_info}
 bundle_config = [
-    (30, "BUNDLE_1"),
-    (59, "BUNDLE_5"),
-    (79, "BUNDLE_10"),
-    (99, "BUNDLE_15"),
+    (9, "BUNDLE_1"),
 ]
 for price, env_key in bundle_config:
     b = _parse_bundle(price, os.getenv(env_key, ""))
@@ -1026,7 +1023,7 @@ async def cmd_start(update, context):
         # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
             rows.append([InlineKeyboardButton(
-                "📦 See Budget Bundles", callback_data="fallback_menu"
+                "⭐⭐ START - ₹9 ⭐⭐", callback_data="fallback_menu"
             )])
 
     else:
@@ -1113,10 +1110,7 @@ async def cb_fallback_menu(update, context):
     
     # Bundle options: (display_name, price_rupees)
     bundles = [
-        ("1 Channel", 30),
-        ("5 Channels", 59),
-        ("10 Channels", 79),
-        ("15 Channels", 99),
+        ("1 Channel", 9),
     ]
     
     kb = InlineKeyboardMarkup([
@@ -1124,13 +1118,10 @@ async def cb_fallback_menu(update, context):
         for name, price in bundles
     ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
     
-    text = (f"<b>💰 Budget Bundles</b>\n\n"
-            f"Get started with affordable options:\n\n"
-            f"• <b>1 Channel</b> — ₹30\n"
-            f"• <b>5 Channels</b> — ₹59\n"
-            f"• <b>10 Channels</b> — ₹79\n"
-            f"• <b>15 Channels</b> — ₹99\n\n"
-            f"<i>Tap any bundle to proceed with payment</i>")
+    text = (f"<b>💰 100% TRUSTED</b>\n\n"
+            f"Enjoy this channel and upgrade Fast:\n\n"
+            f"• <b>1 Channel</b> — ₹9\n"
+            f"<i>FAST - 99 SLOTS will CLOSE SOON!!!</i>")
     
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -1416,7 +1407,7 @@ async def cb_upi_start(update, context):
 
     # Send a clean text message offering verification choice
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Send UPI Name",
+        [InlineKeyboardButton("✅ CLICK HERE",
                               callback_data=f"proof:name:{pid}")],
     ])
     m = await context.bot.send_message(
@@ -1449,8 +1440,8 @@ async def cb_proof_choice(update, context):
     if choice == "name":
         AWAITING_UPI[user.id] = pid
         await edit_main(context, user.id, q.message.message_id,
-                        "✍️ <b>UPI NAME?</b>\n\n"
-                        "Type the name on your UPI account.\n\n"
+                        "✍️ <b>ENTER UPI NAME?</b>\n\n"
+                        "Enter your correct UPI Name to verify!\n\n"
                         "Example: <b>Sakshi</b>")
     else:  # shot
         update_purchase(pid, status="screenshot_requested")
@@ -1817,7 +1808,7 @@ async def cb_admin(update, context):
                     )])
                     if is_fallback_enabled():
                         rows.append([InlineKeyboardButton(
-                            "📦 See Budget Bundles", callback_data="fallback_menu"
+                            "⭐⭐ START - ₹9 ⭐⭐", callback_data="fallback_menu"
                         )])
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
@@ -1892,7 +1883,7 @@ async def cb_admin(update, context):
                 kb_rows.append([InlineKeyboardButton(
                     f"✅ {c['name']} — Join", url=c["link"]
                 )])
-            elif c["id"] == CHANNELS[0]["id"]:
+            elif c["id"] == p["channel_id"]:
                 # Tier 1 — always show the retry button
                 kb_rows.append([InlineKeyboardButton(
                     f"🔁 Try Again — {c['name']} ₹{c['price']}",
