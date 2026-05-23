@@ -1183,7 +1183,7 @@ async def cb_buy_bundle(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅", callback_data=f"upi:start:{pid}")
     ]])
     
     with open(qr_path, "rb") as fh:
@@ -1318,7 +1318,7 @@ async def cb_buy(update, context):
         "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid", callback_data=f"upi:start:{pid}")
+        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅", callback_data=f"upi:start:{pid}")
     ]])
 
     with open(qr_path, "rb") as fh:
@@ -1377,7 +1377,7 @@ async def send_upi_prompt(context):
         f"✅ Paid?"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ I've Paid",
+        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅",
                              callback_data=f"upi:start:{pid}")
     ]])
     try:
@@ -1418,8 +1418,8 @@ async def cb_upi_start(update, context):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Send UPI Name",
                               callback_data=f"proof:name:{pid}")],
-        [InlineKeyboardButton("📸 Send Screenshot",
-                              callback_data=f"proof:shot:{pid}")],
+        """[InlineKeyboardButton("📸 Send Screenshot",
+                              callback_data=f"proof:shot:{pid}")],"""
     ])
     m = await context.bot.send_message(
         chat_id=user.id,
