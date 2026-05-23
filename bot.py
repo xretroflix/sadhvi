@@ -2139,46 +2139,143 @@ async def cmd_resetall(update, context):
 
 
 async def cmd_broadcast(update, context):
-    """Admin: /broadcast <message> — send announcement to all users.
-    Format: /broadcast Your message text here.
-    Supports HTML formatting in the message."""
+    """Admin: /broadcast [segment] <message>
+    
+    Segment is optional — defaults to 'all'.
+    Blocked users are always skipped.
+    
+    Examples:
+    /broadcast Hello everyone!                     → all users
+    /broadcast unpaid Hey, still interested?       → unpaid users only
+    /broadcast T1 Upgrade to Tier 2 now!          → Tier 1 owners only
+    /broadcast all Big announcement!               → all users (explicit)
+    """
     if update.effective_user.id != ADMIN_ID:
         return
-    msg = update.message.text.split(maxsplit=1)
-    if len(msg) < 2:
+
+    args = update.message.text.split(maxsplit=2)
+    # args[0] = /broadcast
+
+    if len(args) < 2:
         await update.message.reply_html(
-            "Usage: <code>/broadcast &lt;message&gt;</code>\n\n"
-            "Example: <code>/broadcast 🎉 New channel added! Check /start</code>\n\n"
-            "Supports HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;"
+            "Usage: <code>/broadcast [segment] &lt;message&gt;</code>\n\n"
+            "Segment is optional (default: all)\n\n"
+            "Segments:\n"
+            "  <code>all</code> — everyone\n"
+            "  <code>unpaid</code> — no approved purchases\n"
+            "  <code>T1</code> — Tier 1 owners\n"
+            "  <code>T1,T2</code> — Tier 1 or 2 owners\n\n"
+            "Examples:\n"
+            "<code>/broadcast Hey everyone!</code>\n"
+            "<code>/broadcast unpaid Still interested?</code>\n"
+            "<code>/broadcast T1 Upgrade now!</code>\n\n"
+            "<i>Blocked users are always skipped.</i>"
         )
         return
 
-    text = msg[1]
-    with db() as conn:
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
+    # Detect if second word is a known segment keyword
+    KNOWN_SEGMENTS = {"all", "unpaid"}
+    # Also detect T1, T1,T2, T1,T2,T3 patterns
+    def is_segment(word):
+        if word.lower() in KNOWN_SEGMENTS:
+            return True
+        # Match T1 / T1,T2 / T1,T2,T3 etc.
+        import re
+        return bool(re.match(r'^T\d+(,T\d+)*$', word, re.IGNORECASE))
 
-    await update.message.reply_text(
-        f"📢 Broadcasting to {len(rows)} users…"
+    second_word = args[1] if len(args) > 1 else ""
+    if is_segment(second_word):
+        segment = second_word.lower()
+        if len(args) < 3:
+            await update.message.reply_html(
+                f"⚠️ You specified segment <b>{segment}</b> but no message.\n\n"
+                f"Usage: <code>/broadcast {segment} your message here</code>"
+            )
+            return
+        text = args[2]
+    else:
+        segment = "all"
+        text = " ".join(args[1:])
+
+    # Get blocked user IDs to exclude
+    with db() as conn:
+        blocked_rows = conn.execute(
+            "SELECT user_id FROM blocked_users"
+        ).fetchall()
+        blocked_ids = {r["user_id"] for r in blocked_rows}
+
+    # Build target user list based on segment
+    with db() as conn:
+        all_users = conn.execute(
+            "SELECT user_id FROM users"
+        ).fetchall()
+        purchases = conn.execute(
+            "SELECT user_id, channel_id FROM purchases WHERE status='approved'"
+        ).fetchall()
+
+    # Build tier map
+    tier_map = {}
+    for p in purchases:
+        uid = p["user_id"]
+        if uid not in tier_map:
+            tier_map[uid] = set()
+        tier_map[uid].add(p["channel_id"])
+
+    # Select users by segment
+    if segment == "all":
+        target_ids = [u["user_id"] for u in all_users]
+    elif segment == "unpaid":
+        target_ids = [u["user_id"] for u in all_users if u["user_id"] not in tier_map]
+    else:
+        # T1 / T1,T2 / T1,T2,T3 etc.
+        try:
+            required_tiers = {int(t.replace("T", "").replace("t", "")) for t in segment.split(",")}
+            target_ids = [
+                u["user_id"] for u in all_users
+                if any(t in tier_map.get(u["user_id"], set()) for t in required_tiers)
+            ]
+        except ValueError:
+            await update.message.reply_text("Invalid segment format.")
+            return
+
+    # Remove blocked users
+    target_ids = [uid for uid in target_ids if uid not in blocked_ids]
+
+    if not target_ids:
+        await update.message.reply_html(
+            f"No eligible users found in segment <b>{segment}</b> "
+            f"(after removing blocked users)."
+        )
+        return
+
+    await update.message.reply_html(
+        f"📢 Broadcasting to <b>{len(target_ids)}</b> users "
+        f"(segment: <b>{segment}</b>, blocked excluded)…"
     )
 
     sent = 0
     failed = 0
-    for r in rows:
+    for uid in target_ids:
         try:
-            await context.bot.send_message(
-                chat_id=r["user_id"],
+            m = await context.bot.send_message(
+                chat_id=uid,
                 text=f"📢 <b>Announcement</b>\n\n{text}",
                 parse_mode=ParseMode.HTML,
                 disable_notification=True,
             )
+            # Track so wipe/reset cleans it up later
+            track_msg(uid, m.message_id)
             sent += 1
         except Exception as e:
-            log.debug(f"broadcast to {r['user_id']} failed: {e}")
+            log.debug(f"broadcast to {uid} failed: {e}")
             failed += 1
 
     await update.message.reply_html(
         f"✅ <b>Broadcast complete.</b>\n"
-        f"Sent: {sent}\nFailed: {failed} <i>(blocked / inactive)</i>"
+        f"Segment : <b>{segment}</b>\n"
+        f"Sent    : {sent}\n"
+        f"Failed  : {failed} <i>(inactive / deactivated)</i>\n"
+        f"Skipped : {len(blocked_ids)} blocked users"
     )
 
 
@@ -2336,15 +2433,66 @@ _HELP_DETAILS = {
     "msg_adm":   ("<b>/msg &lt;user_id&gt;</b>\n\nOpen a direct chat link for a user without "
                   "sending a message.\n\n"
                   "<b>Example:</b> <code>/msg 123456789</code>"),
+    "retarget":  ("<b>/retarget &lt;rejected|cancelled|all&gt; &lt;channel_id&gt; &lt;price&gt; [CONFIRM]</b>\n\n"
+                  "Send offer to users whose payments were rejected or cancelled "
+                  "(only targets users with no approved purchases).\n\n"
+                  "<b>Examples:</b>\n"
+                  "<code>/retarget rejected 1 99 CONFIRM</code>\n"
+                  "<code>/retarget cancelled 1 79 CONFIRM</code>\n"
+                  "<code>/retarget all 1 89 CONFIRM</code>"),
+    "offer_users": ("<b>/offer_users &lt;channel_id&gt; &lt;price&gt; &lt;user_id1&gt; [user_id2] ...</b>\n\n"
+                  "Send the same offer to multiple specific users by space-separated IDs.\n\n"
+                  "<b>Example:</b> <code>/offer_users 1 150 123456789 987654321</code>"),
+    "bulk_ids":  ("<b>/bulk_ids &lt;segment&gt;</b>\n\nGet comma-separated User ID list for any segment. "
+                  "Ready to paste into /bulk_promo_users.\n\n"
+                  "Segments: unpaid, T1, T1,T2, all\n\n"
+                  "<b>Example:</b> <code>/bulk_ids unpaid</code>"),
+    "bulk_promo_users": ("<b>/bulk_promo_users &lt;user_ids&gt; &lt;channel_id&gt; &lt;price&gt; CONFIRM</b>\n\n"
+                  "Send promotion to multiple users by comma-separated IDs.\n\n"
+                  "<b>Example:</b> <code>/bulk_promo_users 123456,789123 1 99 CONFIRM</code>"),
+    "offer_tier": ("<b>/offer_tier &lt;tier&gt; &lt;channel_id&gt; &lt;price&gt; CONFIRM</b>\n\n"
+                  "Send offer to all users in a tier segment.\n\n"
+                  "Tiers: unpaid, T1, T1,T2, all\n\n"
+                  "<b>Example:</b> <code>/offer_tier unpaid 1 150 CONFIRM</code>"),
+    "offer_user": ("<b>/offer_user &lt;user_id&gt; &lt;channel_id&gt; &lt;price&gt;</b>\n\n"
+                  "Send a specific offer to one user.\n\n"
+                  "<b>Example:</b> <code>/offer_user 123456789 1 150</code>"),
+    "unpaid":    ("<b>/unpaid</b>\n\nShow all users segmented by tier with prominent IDs. "
+                  "Also sends a CSV for copy-paste targeting.\n\n"
+                  "<b>Example:</b> <code>/unpaid</code>"),
+    "promo_set": ("<b>/promo_set &lt;channel_id&gt; &lt;segment&gt; &lt;price&gt;</b>\n\n"
+                  "Set an active promotion price for a channel+segment. "
+                  "Overrides custom and default prices.\n\n"
+                  "<b>Example:</b> <code>/promo_set 1 unpaid 99</code>"),
+    "promo_clear": ("<b>/promo_clear &lt;channel_id&gt; &lt;segment&gt;</b>\n\n"
+                  "Deactivate a promotion. Price reverts to custom or default.\n\n"
+                  "<b>Example:</b> <code>/promo_clear 1 unpaid</code>"),
+    "promo_status": ("<b>/promo_status</b>\n\nShow all currently active promotions.\n\n"
+                  "<b>Example:</b> <code>/promo_status</code>"),
+    "promo_send": ("<b>/promo_send &lt;channel_id&gt; &lt;segment&gt; CONFIRM</b>\n\n"
+                  "Blast the active promotion price to all users in a segment.\n\n"
+                  "<b>Example:</b> <code>/promo_send 1 unpaid CONFIRM</code>"),
+    "promo_personal": ("<b>/promo_personal &lt;user_id&gt; &lt;channel_id&gt; &lt;price&gt;</b>\n\n"
+                  "Send an exclusive personal offer to one specific user.\n\n"
+                  "<b>Example:</b> <code>/promo_personal 123456789 1 99</code>"),
+    "fallback_toggle": ("<b>/fallback_toggle &lt;on|off|status&gt;</b>\n\n"
+                  "Enable or disable the budget bundle offers for unpaid users.\n\n"
+                  "<b>Example:</b> <code>/fallback_toggle on</code>"),
+    "special_offers_toggle": ("<b>/special_offers_toggle &lt;on|off|status&gt;</b>\n\n"
+                  "Enable or disable all special offer and promo commands.\n\n"
+                  "<b>Example:</b> <code>/special_offers_toggle on</code>"),
 }
 
 _HELP_SECTIONS = [
-    ("📊 Stats & Reports",  ["stats", "pending", "summary", "listusers", "find", "whoami"]),
-    ("🧹 Cleanup (single)", ["wipe", "reset", "resetme"]),
-    ("☢️ Cleanup (ALL)",    ["wipeall", "resetall"]),
-    ("📢 Communication",    ["broadcast", "msg", "away", "block", "unblock"]),
-    ("💾 DB Backup",        ["backup", "restore", "import_csv"]),
-    ("📋 Diagnostics",      ["logs"]),
+    ("📊 Stats & Reports",      ["stats", "pending", "summary", "listusers", "find", "whoami", "unpaid"]),
+    ("🧹 Cleanup (single)",     ["wipe", "reset", "resetme"]),
+    ("☢️ Cleanup (ALL)",        ["wipeall", "resetall"]),
+    ("📢 Communication",        ["broadcast", "msg", "away", "block", "unblock"]),
+    ("🎯 Targeting & Offers",   ["offer_tier", "offer_user", "offer_users", "retarget", "bulk_ids", "bulk_promo_users"]),
+    ("🎉 Promotions",           ["promo_set", "promo_clear", "promo_status", "promo_send", "promo_personal"]),
+    ("⚙️ Settings",             ["fallback_toggle", "special_offers_toggle"]),
+    ("💾 DB Backup",            ["backup", "restore", "import_csv"]),
+    ("📋 Diagnostics",          ["logs"]),
 ]
 
 
