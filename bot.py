@@ -1699,6 +1699,11 @@ async def cb_admin(update, context):
         update_purchase(pid, status="approved",
                         approved_at=datetime.utcnow().isoformat())
 
+        # Cancel all pending animation jobs for this purchase
+        for i in range(8):
+            for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
+                job.schedule_removal()
+
         # Build keyboard:
         #  ✅ Just-approved channel → Join URL button (single green tick)
         #  🔒 Unowned channels → buy callback buttons
@@ -1891,6 +1896,11 @@ async def cb_admin(update, context):
     elif action == "reject":
         update_purchase(pid, status="rejected",
                         rejected_at=datetime.utcnow().isoformat())
+
+        # Cancel all pending animation jobs for this purchase
+        for i in range(8):
+            for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
+                job.schedule_removal()
 
         # Build keyboard for rejection. Logic:
         #   - Owned channels → ✅ Join button
