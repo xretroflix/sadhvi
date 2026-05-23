@@ -1114,14 +1114,14 @@ async def cb_fallback_menu(update, context):
     ]
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📦 {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
+        [InlineKeyboardButton(f"⭐ {name} — ₹{price}", callback_data=f"buy_bundle:{price}")]
         for name, price in bundles
     ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
     
     text = (f"<b>💰 100% TRUSTED</b>\n\n"
             f"Enjoy this channel and upgrade Fast:\n\n"
-            f"• <b>1 Channel</b> — ₹9\n"
-            f"<i>FAST - 99 SLOTS will CLOSE SOON!!!</i>")
+            f"• <b>1 Channel</b> — ₹9\n\n"
+            f"<i>Enjoy And Return Back Soon!!!</i>")
     
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -1407,8 +1407,10 @@ async def cb_upi_start(update, context):
 
     # Send a clean text message offering verification choice
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ CLICK HERE",
+        [InlineKeyboardButton("👤 Send UPI Name",
                               callback_data=f"proof:name:{pid}")],
+        [InlineKeyboardButton("📸 Send Screenshot",
+                          callback_data=f"proof:shot:{pid}")],
     ])
     m = await context.bot.send_message(
         chat_id=user.id,
@@ -1440,7 +1442,7 @@ async def cb_proof_choice(update, context):
     if choice == "name":
         AWAITING_UPI[user.id] = pid
         await edit_main(context, user.id, q.message.message_id,
-                        "✍️ <b>ENTER UPI NAME?</b>\n\n"
+                        "💳 💰 <b>ENTER UPI NAME?</b>\n\n"
                         "Enter your correct UPI Name to verify!\n\n"
                         "Example: <b>Sakshi</b>")
     else:  # shot
