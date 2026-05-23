@@ -1634,6 +1634,31 @@ async def on_photo(update, context):
 # ==================================================================
 # ADMIN: approve / reject / request screenshot
 # ==================================================================
+def build_reject_kb(user_id, p):
+    """Build rejection keyboard fresh from DB — retry button for the
+    rejected channel, join buttons for owned, locked for others."""
+    owned_now = get_owned_channel_ids(user_id)
+    owns_tier1 = (CHANNELS and CHANNELS[0]["id"] in owned_now)
+    kb_rows = []
+    for c in CHANNELS:
+        if c["id"] in owned_now:
+            kb_rows.append([InlineKeyboardButton(
+                f"✅ {c['name']} — Join", url=c["link"]
+            )])
+        elif c["id"] == p["channel_id"]:
+            # The rejected channel — show retry for that specific tier
+            kb_rows.append([InlineKeyboardButton(
+                f"🔁 Try Again — {c['name']} ₹{c['price']}",
+                callback_data=f"buy:{c['id']}",
+            )])
+        elif owns_tier1:
+            kb_rows.append([InlineKeyboardButton(
+                f"🔒 {c['name']} — ₹{c['price']}",
+                callback_data=f"buy:{c['id']}",
+            )])
+    return InlineKeyboardMarkup(kb_rows)
+
+
 async def cb_admin(update, context):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
@@ -1903,38 +1928,13 @@ async def cb_admin(update, context):
 
         # Cancel all pending animation jobs immediately
         for i in range(8):
-            for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
+            for job in context.job_queue.get_jobs_by_name(
+                    f"anim_{user_id}_{pid}_{i}"):
                 job.schedule_removal()
 
-        # Build keyboard for rejection. Logic:
-        #   - Owned channels → ✅ Join button
-        #   - Tier 1 not owned → only show Tier 1 retry button (others gated)
-        #   - Tier 1 owned → show all unowned tiers as 🔒 buttons
-        owned_now = get_owned_channel_ids(user_id)
-        owns_tier1 = (CHANNELS and CHANNELS[0]["id"] in owned_now)
-        kb_rows = []
-        for c in CHANNELS:
-            if c["id"] in owned_now:
-                # Already owned → green tick + Join URL
-                kb_rows.append([InlineKeyboardButton(
-                    f"✅ {c['name']} — Join", url=c["link"]
-                )])
-            elif c["id"] == p["channel_id"]:
-                # Tier 1 — always show the retry button
-                kb_rows.append([InlineKeyboardButton(
-                    f"🔁 Try Again — {c['name']} ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
-                )])
-            elif owns_tier1:
-                # Higher tier, user has Tier 1 → show as buyable
-                kb_rows.append([InlineKeyboardButton(
-                    f"🔒 {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
-                )])
-            # else: higher tier, user lacks Tier 1 → hide it (would just block)
-        reject_kb = InlineKeyboardMarkup(kb_rows)
-
         rejection_text = "❌ <b>REJECTED</b>\n\n<i>Payment not verified.</i>"
+        reject_kb = build_reject_kb(user_id, p)
+
         delivered = False
         if p.get("main_msg_id"):
             delivered = await edit_main(
@@ -1942,7 +1942,7 @@ async def cb_admin(update, context):
                 rejection_text, reply_markup=reject_kb,
             )
 
-        # Fallback — if edit failed (e.g. animation overwrote it), send fresh
+        # Fallback — edit failed, send a fresh message with keyboard
         if not delivered:
             try:
                 m = await context.bot.send_message(
@@ -1959,23 +1959,27 @@ async def cb_admin(update, context):
             except Exception as e:
                 log.error(f"reject delivery failed: {e}")
 
-        # Re-confirm rejection 6s later — catches any in-flight animation
-        # that slipped past the cancellation and overwrote the rejection edit
+        # Reconfirm at 10s — catches any in-flight animation that
+        # slipped past cancellation and overwrote the rejection.
+        # Rebuilds keyboard fresh from DB to avoid stale closure.
         async def reconfirm_rejection(ctx):
             rp = get_purchase(pid)
             if not rp or rp["status"] != "rejected":
                 return
             if not rp.get("main_msg_id"):
                 return
-            await edit_main(ctx, user_id, rp["main_msg_id"],
-                            rejection_text, reply_markup=reject_kb)
+            fresh_kb = build_reject_kb(user_id, rp)
+            await edit_main(
+                ctx, user_id, rp["main_msg_id"],
+                rejection_text, reply_markup=fresh_kb,
+            )
 
         context.job_queue.run_once(
             reconfirm_rejection,
-            when=6,
+            when=10,
             name=f"reconfirm_reject_{pid}",
         )
-        
+
         chat_link = f"tg://user?id={user_id}"
         await _edit_admin_card(q,
             extra=f"\n\n❌ <b>REJECTED</b> {datetime.now(TZ):%d-%b %H:%M}",
@@ -1984,6 +1988,9 @@ async def cb_admin(update, context):
                 [InlineKeyboardButton("🧹 Wipe Now",
                                        callback_data=f"adm:wipe:{user_id}")],
             ]))
+
+        schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
+        await event_backup(context)
 
         # Auto-wipe user chat after delay so it looks fresh next time
         schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
