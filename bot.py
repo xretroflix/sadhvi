@@ -88,7 +88,7 @@ def _parse_bundle(price: int, s: str):
 
 BUNDLES = {}  # {price: bundle_info}
 bundle_config = [
-    (9, "BUNDLE_1"),
+    (299, "BUNDLE_1"),
 ]
 for price, env_key in bundle_config:
     b = _parse_bundle(price, os.getenv(env_key, ""))
@@ -1039,7 +1039,7 @@ async def cmd_start(update, context):
         # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
             rows.append([InlineKeyboardButton(
-                "⭐⭐ START - ₹9 ⭐⭐", callback_data="fallback_menu"
+                "⭐⭐ MALLU PREMIUM - 299 ⭐⭐", callback_data="fallback_menu"
             )])
 
     else:
@@ -1126,7 +1126,7 @@ async def cb_fallback_menu(update, context):
     
     # Bundle options: (display_name, price_rupees)
     bundles = [
-        ("1 Channel", 9),
+        ("1 Channel", 299),
     ]
     
     kb = InlineKeyboardMarkup([
@@ -1136,7 +1136,7 @@ async def cb_fallback_menu(update, context):
     
     text = (f"<b>💰 100% TRUSTED</b>\n\n"
             f"Enjoy this channel and upgrade Fast:\n\n"
-            f"• <b>1 Channel</b> — ₹9\n\n"
+            f"• <b>1 Channel</b> — ₹299\n\n"
             f"<i>Enjoy And Return Back Soon!!!</i>")
     
     try:
@@ -1864,7 +1864,7 @@ async def cb_admin(update, context):
                     )])
                     if is_fallback_enabled():
                         rows.append([InlineKeyboardButton(
-                            "⭐⭐ START - ₹9 ⭐⭐", callback_data="fallback_menu"
+                            "⭐⭐ MALLU PREMIUM - ₹299 ⭐⭐", callback_data="fallback_menu"
                         )])
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
