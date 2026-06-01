@@ -1135,9 +1135,9 @@ async def cb_fallback_menu(update, context):
     ] + [[InlineKeyboardButton("⬅️ Back", callback_data="back_to_start")]])
     
     text = (f"<b>💰 100% TRUSTED</b>\n\n"
-            f"Enjoy this channel and upgrade Fast:\n\n"
-            f"• <b>1 Channel</b> — ₹299\n\n"
-            f"<i>Enjoy And Return Back Soon!!!</i>")
+            f"Mallu Premium Collection\n\n"
+            f"• <b>Premium Updates</b> — ₹299\n\n"
+            f"<i>Enjoy And Stay For More!!!</i>")
     
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
