@@ -1126,7 +1126,7 @@ async def cb_fallback_menu(update, context):
     
     # Bundle options: (display_name, price_rupees)
     bundles = [
-        ("1 Channel", 299),
+        ("Premium Collection", 299),
     ]
     
     kb = InlineKeyboardMarkup([
