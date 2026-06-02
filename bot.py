@@ -582,6 +582,62 @@ def get_users_by_purchase_status(status: str) -> list:
         """, (status,)).fetchall()
     return [dict(r) for r in rows]
 
+def is_tier_gate_enabled() -> bool:
+    """Check if Tier 1 mandatory gate is enabled (default: True)."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM admin_settings WHERE key='tier_gate_enabled'"
+        ).fetchone()
+    return r["value"].lower() == "true" if r else True
+
+async def cmd_tier_gate(update, context):
+    """Admin: /tier_gate <on|off|status>
+
+    on  → Tier 1 mandatory (default). Users must buy T1 before T2+.
+    off → All tiers visible directly. No mandatory gate.
+
+    Examples:
+    /tier_gate on
+    /tier_gate off
+    /tier_gate status
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/tier_gate &lt;on|off|status&gt;</code>\n\n"
+            "<code>/tier_gate on</code> — Tier 1 mandatory before T2+\n"
+            "<code>/tier_gate off</code> — All tiers visible directly\n"
+            "<code>/tier_gate status</code> — Check current setting"
+        )
+        return
+
+    action = args[0].lower()
+
+    if action == "status":
+        enabled = is_tier_gate_enabled()
+        status = "🔒 ON (Tier 1 mandatory)" if enabled else "🔓 OFF (all tiers visible)"
+        await update.message.reply_html(
+            f"<b>Tier Gate:</b> {status}\n\n"
+            f"<i>{'Users must buy Tier 1 before accessing higher tiers.' if enabled else 'All tiers are directly purchasable without Tier 1.'}</i>"
+        )
+        return
+
+    if action not in ["on", "off"]:
+        await update.message.reply_text("Use: on, off, or status")
+        return
+
+    enabled = action == "on"
+    set_admin_setting("tier_gate_enabled", "true" if enabled else "false")
+
+    status = "🔒 ON (Tier 1 mandatory)" if enabled else "🔓 OFF (all tiers visible)"
+    await update.message.reply_html(
+        f"<b>Tier Gate:</b> {status}\n\n"
+        f"<i>Next /start will reflect this change for all users.</i>"
+    )
+
 async def clear_tracked(context, user_id):
     """Delete all tracked bot messages in user's chat."""
     ids = get_tracked_msgs(user_id)
@@ -1027,14 +1083,25 @@ async def cmd_start(update, context):
         
         else:
             # ========== DEFAULT SINGLE-TIER MODE ==========
-            c = CHANNELS[0]
-            price = c["price"]
-            rows.append([InlineKeyboardButton(
-                f"⭐ Enjoy 15+ Channels — ₹{price}",
-                callback_data=f"buy:{c['id']}",
-            )])
-            intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
-                     f"<b>Get started with {c['name']} at ₹{price}</b>")
+            if is_tier_gate_enabled():
+                # Show only Tier 1 entry point
+                c = CHANNELS[0]
+                price = c["price"]
+                rows.append([InlineKeyboardButton(
+                    f"⭐ Enjoy 15+ Channels — ₹{price}",
+                    callback_data=f"buy:{c['id']}",
+                )])
+                intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
+                         f"<b>Get started with {c['name']} at ₹{price}</b>")
+            else:
+                # Gate off — show ALL channels directly
+                intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
+                         f"<b>Choose any channel to get started:</b>")
+                for c in CHANNELS:
+                    rows.append([InlineKeyboardButton(
+                        f"⭐ {c['name']} — ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
         
         # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
@@ -1274,8 +1341,10 @@ async def cb_buy(update, context):
             log.debug(f"already-owned edit failed: {e}")
         return
 
-    # TIER 1 MANDATORY CHECK: If trying to buy T2+ without T1, block
-    if cid != CHANNELS[0]["id"] and not has_paid_tier1(user.id):
+    # TIER 1 MANDATORY CHECK: only enforce if gate is enabled
+    if (is_tier_gate_enabled()
+            and cid != CHANNELS[0]["id"]
+            and not has_paid_tier1(user.id)):
         try:
             await q.edit_message_text(
                 text=(f"🔐 <b>Access Restricted</b>\n\n"
@@ -2422,6 +2491,285 @@ async def cmd_find(update, context):
 
     await update.message.reply_html(text, disable_web_page_preview=True)
 
+async def cmd_approve(update, context):
+    """Admin: /approve <user_id> [channel_id]
+    
+    Manually approve the latest pending purchase for a user.
+    If channel_id is given, approves that specific channel's purchase.
+    
+    Examples:
+    /approve 123456789          → approves latest pending purchase
+    /approve 123456789 1        → approves pending purchase for channel 1
+    /approve 123456789 pid:55   → approves by exact purchase ID
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/approve &lt;user_id&gt; [channel_id]</code>\n\n"
+            "Examples:\n"
+            "<code>/approve 123456789</code> — latest pending\n"
+            "<code>/approve 123456789 1</code> — channel 1 pending\n"
+            "<code>/approve 123456789 pid:55</code> — exact purchase ID"
+        )
+        return
+
+    try:
+        user_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid user_id.")
+        return
+
+    # Find the purchase
+    p = None
+    if len(args) >= 2:
+        second = args[1]
+        if second.startswith("pid:"):
+            # Exact purchase ID
+            try:
+                pid = int(second.replace("pid:", ""))
+                p = get_purchase(pid)
+                if p and p["user_id"] != user_id:
+                    await update.message.reply_text(
+                        "⚠️ Purchase ID does not belong to that user."
+                    )
+                    return
+            except ValueError:
+                await update.message.reply_text("⚠️ Invalid purchase ID.")
+                return
+        else:
+            # Channel ID — find latest pending for that channel
+            try:
+                channel_id = int(second)
+                with db() as conn:
+                    r = conn.execute("""
+                        SELECT * FROM purchases
+                        WHERE user_id=? AND channel_id=?
+                        AND status NOT IN ('approved','rejected','cancelled')
+                        ORDER BY id DESC LIMIT 1
+                    """, (user_id, channel_id)).fetchone()
+                p = dict(r) if r else None
+            except ValueError:
+                await update.message.reply_text("⚠️ Invalid channel_id.")
+                return
+    else:
+        # Latest pending purchase for this user
+        with db() as conn:
+            r = conn.execute("""
+                SELECT * FROM purchases
+                WHERE user_id=? AND status NOT IN ('approved','rejected','cancelled')
+                ORDER BY id DESC LIMIT 1
+            """, (user_id,)).fetchone()
+        p = dict(r) if r else None
+
+    if not p:
+        await update.message.reply_html(
+            f"⚠️ No pending purchase found for user <code>{user_id}</code>.\n\n"
+            f"Use <code>/whoami {user_id}</code> to check their purchase history."
+        )
+        return
+
+    pid = p["id"]
+
+    # Cancel any animation jobs
+    for i in range(8):
+        for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
+            job.schedule_removal()
+
+    # Mark approved
+    update_purchase(pid, status="approved",
+                    approved_at=datetime.utcnow().isoformat())
+
+    # Build approval keyboard
+    owned_before = get_owned_channel_ids(user_id) - {p["channel_id"]}
+    kb_rows = []
+
+    if p["channel_id"] == 0:
+        bundle_price = p["amount"]
+        if bundle_price in BUNDLES:
+            bundle = BUNDLES[bundle_price]
+            kb_rows.append([InlineKeyboardButton(
+                f"✅ {bundle['name']} — Join", url=bundle["link"]
+            )])
+    else:
+        for c in CHANNELS:
+            if c["id"] == p["channel_id"]:
+                kb_rows.append([InlineKeyboardButton(
+                    f"✅ {c['name']} — Join", url=c["link"]
+                )])
+            elif c["id"] in owned_before:
+                continue
+            else:
+                kb_rows.append([InlineKeyboardButton(
+                    f"🔒 {c['name']} — ₹{c['price']}",
+                    callback_data=f"buy:{c['id']}",
+                )])
+
+    kb = InlineKeyboardMarkup(kb_rows)
+    approval_text = f"🎉 <b>APPROVED</b>\n\n✅ <b>{p.get('channel_name', 'Channel')}</b>"
+
+    # Deliver to user
+    delivered = False
+    if p.get("main_msg_id"):
+        delivered = await edit_main(
+            context, user_id, p["main_msg_id"],
+            approval_text, reply_markup=kb,
+        )
+    if not delivered:
+        try:
+            m = await context.bot.send_message(
+                chat_id=user_id,
+                text=approval_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                protect_content=True,
+                disable_notification=True,
+            )
+            track_msg(user_id, m.message_id)
+            update_purchase(pid, main_msg_id=m.message_id)
+            delivered = True
+        except Exception as e:
+            log.error(f"cmd_approve delivery failed: {e}")
+
+    schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
+    await event_backup(context)
+
+    await update.message.reply_html(
+        f"✅ <b>Approved</b>\n\n"
+        f"User    : <code>{user_id}</code>\n"
+        f"Channel : {p['channel_name']}\n"
+        f"Amount  : ₹{p['amount']}\n"
+        f"Purchase: #{pid}\n"
+        f"Delivered: {'✅ Yes' if delivered else '❌ Failed — user may need to /start'}"
+    )
+
+
+async def cmd_reject(update, context):
+    """Admin: /reject <user_id> [channel_id]
+    
+    Manually reject the latest pending purchase for a user.
+    
+    Examples:
+    /reject 123456789           → rejects latest pending purchase
+    /reject 123456789 1         → rejects pending purchase for channel 1
+    /reject 123456789 pid:55    → rejects by exact purchase ID
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/reject &lt;user_id&gt; [channel_id]</code>\n\n"
+            "Examples:\n"
+            "<code>/reject 123456789</code> — latest pending\n"
+            "<code>/reject 123456789 1</code> — channel 1 pending\n"
+            "<code>/reject 123456789 pid:55</code> — exact purchase ID"
+        )
+        return
+
+    try:
+        user_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid user_id.")
+        return
+
+    # Find the purchase
+    p = None
+    if len(args) >= 2:
+        second = args[1]
+        if second.startswith("pid:"):
+            try:
+                pid = int(second.replace("pid:", ""))
+                p = get_purchase(pid)
+                if p and p["user_id"] != user_id:
+                    await update.message.reply_text(
+                        "⚠️ Purchase ID does not belong to that user."
+                    )
+                    return
+            except ValueError:
+                await update.message.reply_text("⚠️ Invalid purchase ID.")
+                return
+        else:
+            try:
+                channel_id = int(second)
+                with db() as conn:
+                    r = conn.execute("""
+                        SELECT * FROM purchases
+                        WHERE user_id=? AND channel_id=?
+                        AND status NOT IN ('approved','rejected','cancelled')
+                        ORDER BY id DESC LIMIT 1
+                    """, (user_id, channel_id)).fetchone()
+                p = dict(r) if r else None
+            except ValueError:
+                await update.message.reply_text("⚠️ Invalid channel_id.")
+                return
+    else:
+        with db() as conn:
+            r = conn.execute("""
+                SELECT * FROM purchases
+                WHERE user_id=? AND status NOT IN ('approved','rejected','cancelled')
+                ORDER BY id DESC LIMIT 1
+            """, (user_id,)).fetchone()
+        p = dict(r) if r else None
+
+    if not p:
+        await update.message.reply_html(
+            f"⚠️ No pending purchase found for user <code>{user_id}</code>.\n\n"
+            f"Use <code>/whoami {user_id}</code> to check their purchase history."
+        )
+        return
+
+    pid = p["id"]
+
+    # Cancel animation jobs
+    for i in range(8):
+        for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
+            job.schedule_removal()
+
+    # Mark rejected
+    update_purchase(pid, status="rejected",
+                    rejected_at=datetime.utcnow().isoformat())
+
+    rejection_text = "❌ <b>REJECTED</b>\n\n<i>Payment not verified.</i>"
+    reject_kb = build_reject_kb(user_id, p)
+
+    delivered = False
+    if p.get("main_msg_id"):
+        delivered = await edit_main(
+            context, user_id, p["main_msg_id"],
+            rejection_text, reply_markup=reject_kb,
+        )
+    if not delivered:
+        try:
+            m = await context.bot.send_message(
+                chat_id=user_id,
+                text=rejection_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reject_kb,
+                protect_content=True,
+                disable_notification=True,
+            )
+            track_msg(user_id, m.message_id)
+            update_purchase(pid, main_msg_id=m.message_id)
+            delivered = True
+        except Exception as e:
+            log.error(f"cmd_reject delivery failed: {e}")
+
+    schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
+    await event_backup(context)
+
+    await update.message.reply_html(
+        f"❌ <b>Rejected</b>\n\n"
+        f"User    : <code>{user_id}</code>\n"
+        f"Channel : {p['channel_name']}\n"
+        f"Amount  : ₹{p['amount']}\n"
+        f"Purchase: #{pid}\n"
+        f"Delivered: {'✅ Yes' if delivered else '❌ Failed — user may need to /start'}"
+    )
+
 
 _HELP_DETAILS = {
     "stats":     ("<b>/stats</b>\n\nOverall bot totals.\n\n"
@@ -2543,6 +2891,26 @@ _HELP_DETAILS = {
     "special_offers_toggle": ("<b>/special_offers_toggle &lt;on|off|status&gt;</b>\n\n"
                   "Enable or disable all special offer and promo commands.\n\n"
                   "<b>Example:</b> <code>/special_offers_toggle on</code>"),
+    "approve": ("<b>/approve &lt;user_id&gt; [channel_id or pid:N]</b>\n\n"
+                "Manually approve a user's pending purchase by command.\n\n"
+                "<b>Examples:</b>\n"
+                "<code>/approve 123456789</code> — latest pending\n"
+                "<code>/approve 123456789 1</code> — channel 1 pending\n"
+                "<code>/approve 123456789 pid:55</code> — exact purchase ID"),
+    "reject":  ("<b>/reject &lt;user_id&gt; [channel_id or pid:N]</b>\n\n"
+                "Manually reject a user's pending purchase by command.\n\n"
+                "<b>Examples:</b>\n"
+                "<code>/reject 123456789</code> — latest pending\n"
+                "<code>/reject 123456789 1</code> — channel 1 pending\n"
+                "<code>/reject 123456789 pid:55</code> — exact purchase ID"),
+    "tier_gate": ("<b>/tier_gate &lt;on|off|status&gt;</b>\n\n"
+                  "Control whether Tier 1 is mandatory before higher tiers.\n\n"
+                  "<code>on</code> — Tier 1 gate active (default)\n"
+                  "<code>off</code> — All tiers directly visible\n"
+                  "<code>status</code> — Check current setting\n\n"
+                  "<b>Examples:</b>\n"
+                  "<code>/tier_gate off</code>\n"
+                  "<code>/tier_gate on</code>"),
 }
 
 _HELP_SECTIONS = [
@@ -2552,9 +2920,10 @@ _HELP_SECTIONS = [
     ("📢 Communication",        ["broadcast", "msg", "away", "block", "unblock"]),
     ("🎯 Targeting & Offers",   ["offer_tier", "offer_user", "offer_users", "retarget", "bulk_ids", "bulk_promo_users"]),
     ("🎉 Promotions",           ["promo_set", "promo_clear", "promo_status", "promo_send", "promo_personal"]),
-    ("⚙️ Settings",             ["fallback_toggle", "special_offers_toggle"]),
+    ("⚙️ Settings",             ["fallback_toggle", "special_offers_toggle", "tier_gate"]),
     ("💾 DB Backup",            ["backup", "restore", "import_csv"]),
     ("📋 Diagnostics",          ["logs"]),
+    ("✅ Manual Approval",  ["approve", "reject"]),
 ]
 
 
@@ -4313,15 +4682,20 @@ async def on_csv_import_file(update, context):
             await update.message.reply_text("❌ CSV file is empty!")
             return
         
+        # Check if overwrite mode requested
+        # Admin sends file caption as "overwrite" to update existing records
+        caption = update.message.caption or ""
+        overwrite_mode = caption.strip().lower() == "overwrite"
+
         # Import records
         imported = 0
+        updated = 0
         skipped = 0
         errors = []
-        
+
         with db() as conn:
             for row in rows:
                 try:
-                    # Extract fields
                     purchase_id = int(row.get('PurchaseID', 0))
                     created_at = row.get('CreatedAt', '')
                     user_id = int(row.get('UserID', 0))
@@ -4332,68 +4706,82 @@ async def on_csv_import_file(update, context):
                     qr = row.get('QR', '')
                     upi_name = row.get('UPIName', '')
                     status = row.get('Status', 'pending')
-                    approved_at = row.get('ApprovedAt', None)
-                    rejected_at = row.get('RejectedAt', None)
-                    
+                    approved_at = row.get('ApprovedAt', None) or None
+                    rejected_at = row.get('RejectedAt', None) or None
+
                     if not user_id or not channel_name or not amount:
                         skipped += 1
                         continue
-                    
+
                     # Check if record already exists
                     existing = conn.execute(
                         "SELECT id FROM purchases WHERE id=?",
                         (purchase_id,)
                     ).fetchone()
-                    
-                    if existing:
-                        skipped += 1
-                        continue
-                    
+
                     # Determine channel_id from channel name
                     channel_id = None
                     for c in CHANNELS:
                         if c['name'] == channel_name:
                             channel_id = c['id']
                             break
-                    
-                    # Insert record
+
+                    if existing:
+                        if overwrite_mode:
+                            # Update existing record with new data
+                            conn.execute("""
+                                UPDATE purchases SET
+                                    channel_name=?, amount=?, upi_name=?,
+                                    status=?, approved_at=?, rejected_at=?
+                                WHERE id=?
+                            """, (channel_name, amount, upi_name,
+                                  status, approved_at, rejected_at,
+                                  purchase_id))
+                            updated += 1
+                        else:
+                            skipped += 1
+                        continue
+
+                    # Insert new record
                     conn.execute("""
-                        INSERT INTO purchases 
-                        (id, user_id, channel_id, channel_name, amount, qr_used, upi_name, 
-                         status, created_at, approved_at, rejected_at)
+                        INSERT INTO purchases
+                        (id, user_id, channel_id, channel_name, amount, qr_used,
+                         upi_name, status, created_at, approved_at, rejected_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (purchase_id, user_id, channel_id or 0, channel_name, amount, 
-                          qr, upi_name, status, created_at, approved_at, rejected_at))
-                    
-                    # Also ensure user exists
+                    """, (purchase_id, user_id, channel_id or 0, channel_name,
+                          amount, qr, upi_name, status, created_at,
+                          approved_at, rejected_at))
+
+                    # Ensure user exists
                     conn.execute("""
                         INSERT OR IGNORE INTO users (user_id, first_name, username)
                         VALUES (?, ?, ?)
                     """, (user_id, name.split()[0] if name else "User", username))
-                    
+
                     imported += 1
-                    
+
                 except Exception as e:
-                    errors.append(f"Row {purchase_id}: {str(e)}")
+                    errors.append(f"Row {row.get('PurchaseID', '?')}: {str(e)}")
                     continue
-            
+
             conn.commit()
-        
+
         # Send summary
+        mode_label = "overwrite" if overwrite_mode else "append"
         summary = (
-            f"✅ <b>CSV Import Complete</b>\n\n"
+            f"✅ <b>CSV Import Complete</b> <i>({mode_label} mode)</i>\n\n"
             f"📊 <b>Results:</b>\n"
-            f"✅ Imported: {imported} records\n"
-            f"⏭️ Skipped: {skipped} records (duplicates/invalid)\n"
+            f"✅ Inserted : {imported} new records\n"
+            f"♻️ Updated  : {updated} existing records\n"
+            f"⏭️ Skipped  : {skipped} duplicates\n"
         )
-        
         if errors:
             summary += f"\n❌ Errors: {len(errors)}\n"
             for err in errors[:5]:
                 summary += f"  • {err}\n"
             if len(errors) > 5:
-                summary += f"  ... and {len(errors)-5} more"
-        
+                summary += f"  ... and {len(errors) - 5} more"
+
         await update.message.reply_html(summary)
         
         # Notify in logs
@@ -4620,6 +5008,9 @@ def main():
     app.add_handler(CommandHandler("backup",      cmd_backup))
     app.add_handler(CommandHandler("import_csv",  cmd_import_csv))
     app.add_handler(CommandHandler("retarget", cmd_retarget))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("reject",  cmd_reject))
+    app.add_handler(CommandHandler("tier_gate", cmd_tier_gate))
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.ChatType.PRIVATE,
         on_csv_import_file
