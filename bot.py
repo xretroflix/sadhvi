@@ -1347,17 +1347,24 @@ async def cb_buy_bundle(update, context):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
     ]])
-    pay_msg = await context.bot.send_message(
-        chat_id=user.id,
-        text=(
-            f"💳 <b>Pay ₹{bundle_price}</b> using the QR above.\n\n"
-            f"<b>STEP 2</b> — After payment is done, tap the button below 👇"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-        protect_content=True,
-        disable_notification=True,
-    )
+
+    with open(qr_path, "rb") as fh:
+        qr_msg = await context.bot.send_photo(
+            chat_id=user.id, photo=fh,
+            caption=(
+                f"💳 <b>Pay ₹{bundle_price}</b> via UPI\n\n"
+                f"📲 <b>STEP 1</b> — Tap image → top-right <b>⋮</b> → "
+                f"<b>Share</b> → choose UPI app\n\n"
+                f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_notification=True,
+        )
+
+    track_msg(user.id, qr_msg.message_id)
+    update_purchase(pid, main_msg_id=qr_msg.message_id,
+                    qr_downloaded_at=datetime.utcnow().isoformat())
 
     # DB updates after both messages are delivered
     track_msg(user.id, qr_msg.message_id)
@@ -1507,19 +1514,24 @@ async def cb_buy(update, context):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
     ]])
-    pay_msg = await context.bot.send_message(
-        chat_id=user.id,
-        text=(
-            f"💳 <b>Pay ₹{bundle_price}</b> using the QR above.\n\n"
-            f"<b>STEP 2</b> — After payment is done, tap the button below 👇"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-        protect_content=True,
-        disable_notification=True,
-    )
-    track_msg(user.id, pay_msg.message_id)
-    update_purchase(pid, main_msg_id=pay_msg.message_id)
+
+    with open(qr_path, "rb") as fh:
+        qr_msg = await context.bot.send_photo(
+            chat_id=user.id, photo=fh,
+            caption=(
+                f"💳 <b>Pay ₹{channel['price']}</b> via UPI\n\n"
+                f"📲 <b>STEP 1</b> — Tap image → top-right <b>⋮</b> → "
+                f"<b>Share</b> → choose UPI app\n\n"
+                f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_notification=True,
+        )
+
+    track_msg(user.id, qr_msg.message_id)
+    update_purchase(pid, main_msg_id=qr_msg.message_id,
+                    qr_downloaded_at=datetime.utcnow().isoformat())
 
     # Schedule QR expiry on the QR photo message
     if QR_EXPIRY_MINUTES > 0:
