@@ -1333,17 +1333,6 @@ async def cb_buy_bundle(update, context):
     await clear_tracked(context, user.id)
     
     # Step 1 + Step 2 sent back-to-back — no DB calls in between
-    with open(qr_path, "rb") as fh:
-        qr_msg = await context.bot.send_photo(
-            chat_id=user.id, photo=fh,
-            caption=(
-                "👆 <b>STEP 1</b> — Scan this QR or tap image → "
-                "top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
-            ),
-            parse_mode=ParseMode.HTML,
-            disable_notification=True,
-        )
-
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
     ]])
@@ -1497,19 +1486,6 @@ async def cb_buy(update, context):
     # Allowing save+share lets users open it in UPI apps via system share sheet.
     # Channel links (the real secret) ARE protected separately on approval.
     # Step 1 — QR photo only, no button
-    with open(qr_path, "rb") as fh:
-        qr_msg = await context.bot.send_photo(
-            chat_id=user.id, photo=fh,
-            caption=(
-                "👆 <b>STEP 1</b> — Scan this QR or tap image → "
-                "top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
-            ),
-            parse_mode=ParseMode.HTML,
-            disable_notification=True,
-        )
-    track_msg(user.id, qr_msg.message_id)
-    update_purchase(pid, qr_downloaded_at=datetime.utcnow().isoformat())
-
     # Step 2 — Separate message with button
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
