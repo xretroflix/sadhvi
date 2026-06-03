@@ -58,6 +58,9 @@ QR_EXPIRY_MINUTES = int(os.getenv("QR_EXPIRY_MINUTES", "15"))
 # When user comes back later, chat looks fresh.
 AUTO_WIPE_MINUTES = int(os.getenv("AUTO_WIPE_MINUTES", "30"))
 
+# Auto-wipe idle user chat after this many MINUTES of no interaction (0 = disabled)
+INACTIVITY_MINUTES = int(os.getenv("INACTIVITY_MINUTES", "5"))
+
 def _parse_channel(s: str):
     if not s or "|" not in s:
         return None
@@ -378,7 +381,7 @@ def get_active_purchase(user_id):
     with db() as conn:
         r = conn.execute("""
             SELECT * FROM purchases
-            WHERE user_id=? AND status NOT IN ('approved','rejected','cancelled')
+            WHERE user_id=? AND status NOT IN ('approved','rejected')
             ORDER BY id DESC LIMIT 1
         """, (user_id,)).fetchone()
         return dict(r) if r else None
@@ -618,7 +621,7 @@ async def cmd_tier_gate(update, context):
 
     if action == "status":
         enabled = is_tier_gate_enabled()
-        status = "🔒 ON (Tier 1 mandatory)" if enabled else "🔓 OFF (all tiers visible)"
+        status = "⭐ ON (Tier 1 mandatory)" if enabled else "🔓 OFF (all tiers visible)"
         await update.message.reply_html(
             f"<b>Tier Gate:</b> {status}\n\n"
             f"<i>{'Users must buy Tier 1 before accessing higher tiers.' if enabled else 'All tiers are directly purchasable without Tier 1.'}</i>"
@@ -632,7 +635,7 @@ async def cmd_tier_gate(update, context):
     enabled = action == "on"
     set_admin_setting("tier_gate_enabled", "true" if enabled else "false")
 
-    status = "🔒 ON (Tier 1 mandatory)" if enabled else "🔓 OFF (all tiers visible)"
+    status = "⭐ ON (Tier 1 mandatory)" if enabled else "🔓 OFF (all tiers visible)"
     await update.message.reply_html(
         f"<b>Tier Gate:</b> {status}\n\n"
         f"<i>Next /start will reflect this change for all users.</i>"
@@ -791,6 +794,80 @@ def schedule_auto_wipe(context, user_id, minutes):
         data={"user_id": user_id},
         name=f"autowipe_{user_id}",
     )
+
+async def inactivity_wipe(context):
+    """JobQueue callback: user went idle mid-flow — wipe their chat entirely."""
+    user_id = context.job.data["user_id"]
+    p = get_active_purchase(user_id)
+
+    # If user has a purchase stuck in mid-flow, cancel it cleanly
+    if p and p["status"] not in ("approved", "rejected", "cancelled"):
+        update_purchase(p["id"], status="cancelled")
+        log.info(f"Inactivity: cancelled purchase #{p['id']} for user {user_id}")
+
+    log.info(f"Inactivity wipe triggered for user {user_id}")
+
+    # Gather ALL known bot message IDs
+    all_ids = set()
+    all_ids.update(get_tracked_msgs(user_id))
+    with db() as conn:
+        u = conn.execute(
+            "SELECT menu_msg_id FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if u and u["menu_msg_id"]:
+            all_ids.add(u["menu_msg_id"])
+        purchases = conn.execute(
+            "SELECT main_msg_id FROM purchases WHERE user_id=?", (user_id,)
+        ).fetchall()
+        for p in purchases:
+            if p["main_msg_id"]:
+                all_ids.add(p["main_msg_id"])
+
+    for mid in all_ids:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=mid)
+        except Exception as e:
+            log.debug(f"inactivity_wipe delete {mid} failed: {e}")
+
+    # Reset message refs — keep purchase records intact
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' "
+            "WHERE user_id=?", (user_id,))
+        conn.execute(
+            "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
+            (user_id,))
+
+    # Remove AWAITING_UPI state if stuck there
+    AWAITING_UPI.pop(user_id, None)
+
+
+def reset_inactivity_timer(context, user_id):
+    """Cancel existing inactivity job and restart fresh.
+    Call this at the start of every user-facing handler."""
+    if INACTIVITY_MINUTES <= 0:
+        return
+
+    job_name = f"inactivity_{user_id}"
+
+    # Cancel existing timer
+    for job in context.job_queue.get_jobs_by_name(job_name):
+        job.schedule_removal()
+
+    # Schedule fresh timer
+    context.job_queue.run_once(
+        inactivity_wipe,
+        when=timedelta(minutes=INACTIVITY_MINUTES),
+        data={"user_id": user_id},
+        name=job_name,
+    )
+
+
+def cancel_inactivity_timer(context, user_id):
+    """Cancel inactivity timer — call when flow completes (approved/rejected)."""
+    for job in context.job_queue.get_jobs_by_name(f"inactivity_{user_id}"):
+        job.schedule_removal()
+
 
 def reset_user_data(user_id: int):
     """Delete all purchases + reset menu/main message refs for a user."""
@@ -996,6 +1073,7 @@ async def cmd_start(update, context):
         return
     
     upsert_user(user)
+    reset_inactivity_timer(context, user.id)
 
     # NOTE: Do NOT delete the user's /start message — Telegram interprets
     # an empty bot chat as "needs Start" and re-shows the floating "Start bot"
@@ -1130,13 +1208,13 @@ async def cmd_start(update, context):
                     f"✅ {bundle['name']}", url=bundle["link"]
                 )])
         
-        # Show unowned channels as upgrades (locked 🔒) — use base price for consistency
+        # Show unowned channels as upgrades (locked ⭐) — use base price for consistency
         for c in CHANNELS:
             if c["id"] not in owned_channel_ids:
                 # Use base channel price (same as initial offer for consistency)
                 price = c["price"]
                 rows.append([InlineKeyboardButton(
-                    f"🔒 {c['name']} — ₹{price}",
+                    f"⭐ {c['name']} — ₹{price}",
                     callback_data=f"buy:{c['id']}",
                 )])
 
@@ -1190,6 +1268,7 @@ async def cb_fallback_menu(update, context):
     
     if is_blocked(user.id):
         return
+    reset_inactivity_timer(context, user.id)
     
     # Bundle options: (display_name, price_rupees)
     bundles = [
@@ -1220,6 +1299,7 @@ async def cb_buy_bundle(update, context):
     
     if is_blocked(user.id):
         return
+    reset_inactivity_timer(context, user.id)
     
     try:
         bundle_price = int(q.data.split(":")[1])
@@ -1252,34 +1332,48 @@ async def cb_buy_bundle(update, context):
         conn.execute("UPDATE users SET menu_msg_id=NULL WHERE user_id=?", (user.id,))
     await clear_tracked(context, user.id)
     
-    # Send QR with "I've Paid" button
-    caption = (
-        "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅", callback_data=f"upi:start:{pid}")
-    ]])
-    
+    # Step 1 — Send QR photo only, no button
     with open(qr_path, "rb") as fh:
-        doc = await context.bot.send_photo(
+        qr_msg = await context.bot.send_photo(
             chat_id=user.id, photo=fh,
-            caption=caption, parse_mode=ParseMode.HTML,
-            reply_markup=kb,
+            caption=(
+                "👆 <b>STEP 1</b> — Scan this QR or tap image → "
+                "top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
+            ),
+            parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
-    track_msg(user.id, doc.message_id)
-    update_purchase(pid, main_msg_id=doc.message_id,
-                    qr_downloaded_at=datetime.utcnow().isoformat())
-    
-    # Schedule QR expiry
+    track_msg(user.id, qr_msg.message_id)
+    update_purchase(pid, qr_downloaded_at=datetime.utcnow().isoformat())
+
+    # Step 2 — Separate message with button so user can't miss it
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
+    ]])
+    pay_msg = await context.bot.send_message(
+        chat_id=user.id,
+        text=(
+            f"💳 <b>Pay ₹{channel['price']}</b> using the QR above.\n\n"
+            f"<b>STEP 2</b> — After payment is done, tap the button below 👇"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        protect_content=True,
+        disable_notification=True,
+    )
+    track_msg(user.id, pay_msg.message_id)
+    update_purchase(pid, main_msg_id=pay_msg.message_id)
+
+    # Schedule QR expiry on the QR photo message
     if QR_EXPIRY_MINUTES > 0:
         context.job_queue.run_once(
             expire_qr,
             when=timedelta(minutes=QR_EXPIRY_MINUTES),
             data={"user_id": user.id, "purchase_id": pid,
-                  "qr_msg_id": doc.message_id},
+                  "qr_msg_id": qr_msg.message_id},
             name=f"qr_expire_{user.id}_{pid}",
         )
+    
     
     # Notify admin
     u_row = get_user_row(user.id)
@@ -1289,7 +1383,9 @@ async def cb_buy_bundle(update, context):
             chat_id=ADMIN_ID,
             text=(f"📥 <b>QR Downloaded (Bundle)</b>\n\n{fmt_user_block(u_row, p_row)}\n\n"
                   f"⏳ Awaiting payment proof…"),
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=admin_action_kb(pid),
         )
     except Exception as e:
         log.error(f"Admin notify failed: {e}")
@@ -1301,9 +1397,11 @@ async def cb_back_to_start(update, context):
     q = update.callback_query
     await q.answer()
     user = q.from_user
+    reset_inactivity_timer(context, user.id)
     
     if is_blocked(user.id):
         return
+    reset_inactivity_timer(context, user.id)
     
     try:
         await q.delete_message()
@@ -1390,32 +1488,45 @@ async def cb_buy(update, context):
     # the worst that happens is someone else also pays you. Harmless.
     # Allowing save+share lets users open it in UPI apps via system share sheet.
     # Channel links (the real secret) ARE protected separately on approval.
-    caption = (
-        "Tap image → top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅✅✅ I've Paid ✅✅✅", callback_data=f"upi:start:{pid}")
-    ]])
-
+    # Step 1 — QR photo only, no button
     with open(qr_path, "rb") as fh:
-        doc = await context.bot.send_photo(
+        qr_msg = await context.bot.send_photo(
             chat_id=user.id, photo=fh,
-            caption=caption, parse_mode=ParseMode.HTML,
-            reply_markup=kb,
+            caption=(
+                "👆 <b>STEP 1</b> — Scan this QR or tap image → "
+                "top-right <b>⋮</b> → <b>Share</b> → choose UPI app"
+            ),
+            parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
-    track_msg(user.id, doc.message_id)
-    update_purchase(pid, main_msg_id=doc.message_id,
-                    qr_downloaded_at=datetime.utcnow().isoformat())
+    track_msg(user.id, qr_msg.message_id)
+    update_purchase(pid, qr_downloaded_at=datetime.utcnow().isoformat())
 
-    # Schedule QR expiry — if user doesn't tap "I've Paid" within
-    # QR_EXPIRY_MINUTES, the QR auto-deletes and chat is cleaned up.
+    # Step 2 — Separate message with button
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
+    ]])
+    pay_msg = await context.bot.send_message(
+        chat_id=user.id,
+        text=(
+            f"💳 <b>Pay ₹{bundle_price}</b> using the QR above.\n\n"
+            f"<b>STEP 2</b> — After payment is done, tap the button below 👇"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        protect_content=True,
+        disable_notification=True,
+    )
+    track_msg(user.id, pay_msg.message_id)
+    update_purchase(pid, main_msg_id=pay_msg.message_id)
+
+    # Schedule QR expiry on the QR photo message
     if QR_EXPIRY_MINUTES > 0:
         context.job_queue.run_once(
             expire_qr,
             when=timedelta(minutes=QR_EXPIRY_MINUTES),
             data={"user_id": user.id, "purchase_id": pid,
-                  "qr_msg_id": doc.message_id},
+                  "qr_msg_id": qr_msg.message_id},
             name=f"qr_expire_{user.id}_{pid}",
         )
 
@@ -1427,7 +1538,9 @@ async def cb_buy(update, context):
             chat_id=ADMIN_ID,
             text=(f"📥 <b>QR Downloaded</b>\n\n{fmt_user_block(u_row, p_row)}\n\n"
                   f"⏳ Awaiting payment proof…"),
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=admin_action_kb(pid),
         )
     except Exception as e:
         log.error(f"Admin notify failed: {e}")
@@ -1483,6 +1596,7 @@ async def cb_upi_start(update, context):
         return
     if p["status"] in ("approved", "rejected", "cancelled"):
         return
+    reset_inactivity_timer(context, user.id)
 
     # Delete the QR photo — user has paid, no need to keep it
     try:
@@ -1523,6 +1637,7 @@ async def cb_proof_choice(update, context):
         return
     if p["status"] in ("approved", "rejected", "cancelled"):
         return
+    reset_inactivity_timer(context, user.id)
 
     if choice == "name":
         AWAITING_UPI[user.id] = pid
@@ -1537,15 +1652,102 @@ async def cb_proof_choice(update, context):
                         "Send your payment success screenshot here.")
 
 
+async def forward_user_message_to_admin(update, context, user):
+    """Forward any unsolicited user message to admin with context + reply button."""
+    text = update.message.text or ""
+    if not text.strip():
+        return
+
+    # Log it
+    log_user_message(user.id, "free_text", text)
+
+    # Get latest purchase for context
+    p = get_active_purchase(user.id)
+    purchase_info = ""
+    if p:
+        purchase_info = (
+            f"\n\n🛒 <b>Active Purchase</b>\n"
+            f"• Channel : {p['channel_name']}\n"
+            f"• Amount  : ₹{p['amount']}\n"
+            f"• Status  : {p['status']}\n"
+            f"• ID      : #{p['id']}"
+        )
+    else:
+        # Check last purchase even if completed
+        with db() as conn:
+            lp = conn.execute("""
+                SELECT * FROM purchases WHERE user_id=?
+                ORDER BY id DESC LIMIT 1
+            """, (user.id,)).fetchone()
+        if lp:
+            purchase_info = (
+                f"\n\n🛒 <b>Last Purchase</b>\n"
+                f"• Channel : {lp['channel_name']}\n"
+                f"• Amount  : ₹{lp['amount']}\n"
+                f"• Status  : {lp['status']}\n"
+                f"• ID      : #{lp['id']}"
+            )
+
+    # Build user info
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "—"
+    un = f"@{user.username}" if user.username else "(no username)"
+
+    admin_text = (
+        f"💬 <b>User Message</b>\n\n"
+        f"👤 {name} {un}\n"
+        f"🆔 <code>{user.id}</code>"
+        f"{purchase_info}\n\n"
+        f"📩 <b>Message:</b>\n"
+        f"{text}"
+    )
+
+    # Reply button for admin to quickly message back
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "💬 Reply to User",
+            url=f"tg://user?id={user.id}"
+        ),
+    ]])
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=admin_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.error(f"forward_user_message_to_admin failed: {e}")
+
+    # Send acknowledgement to user so they know message was received
+    try:
+        ack = await context.bot.send_message(
+            chat_id=user.id,
+            text="📨 <b>Message received.</b>\n\nAdmin will get back to you shortly.",
+            parse_mode=ParseMode.HTML,
+            disable_notification=True,
+        )
+        track_msg(user.id, ack.message_id)
+        # Auto-delete ack after 30s — keeps chat clean
+        schedule_auto_delete(context, user.id, ack.message_id, delay_seconds=30)
+    except Exception as e:
+        log.debug(f"ack to user failed: {e}")
+
+
 async def on_text_message(update, context):
     user = update.effective_user
-    
+
     # Check if user is blocked
     if is_blocked(user.id):
         return
-    
+    reset_inactivity_timer(context, user.id)
+
     if user.id not in AWAITING_UPI:
-        return  # not in capture state, ignore
+        # User sent a free-text message mid-flow or after QR —
+        # forward it to admin so nothing gets missed
+        await forward_user_message_to_admin(update, context, user)
+        return
 
     pid = AWAITING_UPI.pop(user.id)
     upi_name = update.message.text.strip()
@@ -1661,15 +1863,53 @@ async def animate_verifying(context):
 # ==================================================================
 async def on_photo(update, context):
     user = update.effective_user
-    
+
     # Check if user is blocked
     if is_blocked(user.id):
         return
-    
+    reset_inactivity_timer(context, user.id)
+
     p = get_active_purchase(user.id)
-    if not p:
-        return
-    if p["status"] != "screenshot_requested":
+    if not p or p["status"] != "screenshot_requested":
+        # Photo sent outside screenshot flow — forward to admin
+        file_id = update.message.photo[-1].file_id
+        log_user_message(user.id, "unsolicited_photo", file_id)
+
+        name = f"{user.first_name or ''} {user.last_name or ''}".strip() or "—"
+        un = f"@{user.username}" if user.username else "(no username)"
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Reply to User", url=f"tg://user?id={user.id}")
+        ]])
+
+        try:
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=file_id,
+                caption=(
+                    f"🖼 <b>User Sent a Photo</b>\n\n"
+                    f"👤 {name} {un}\n"
+                    f"🆔 <code>{user.id}</code>\n\n"
+                    f"<i>Sent outside of screenshot flow.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+        except Exception as e:
+            log.error(f"forward unsolicited photo failed: {e}")
+
+        # Ack to user
+        try:
+            ack = await context.bot.send_message(
+                chat_id=user.id,
+                text="📨 <b>Photo received.</b>\n\nAdmin will get back to you shortly.",
+                parse_mode=ParseMode.HTML,
+                disable_notification=True,
+            )
+            track_msg(user.id, ack.message_id)
+            schedule_auto_delete(context, user.id, ack.message_id, delay_seconds=30)
+        except Exception as e:
+            log.debug(f"ack photo to user failed: {e}")
         return
 
     file_id = update.message.photo[-1].file_id
@@ -1700,6 +1940,208 @@ async def on_photo(update, context):
     except Exception as e:
         log.error(f"Admin screenshot send failed: {e}")
 
+async def on_admin_media(update, context):
+    """Handle media (photo/video/document) sent by admin.
+    
+    For broadcast:
+        Send media to admin bot with caption:
+        /broadcast [segment] optional text
+        
+    For msg to one user:
+        Send media to admin bot with caption:
+        /msg 123456789 optional text
+    """
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+
+    msg = update.message
+    caption = (msg.caption or "").strip()
+
+    if not caption:
+        await msg.reply_text(
+            "Add a caption to use this media:\n\n"
+            "<code>/broadcast [segment] text</code>\n"
+            "<code>/msg user_id text</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Parse first word as command
+    parts = caption.split(maxsplit=2)
+    command = parts[0].lower().lstrip("/")
+
+    # ── /msg user_id [text] ──────────────────────────────────────────
+    if command == "msg":
+        if len(parts) < 2:
+            await msg.reply_text("Usage in caption: /msg <user_id> [text]")
+            return
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await msg.reply_text("⚠️ Invalid user_id.")
+            return
+
+        extra_text = parts[2] if len(parts) > 2 else ""
+        full_caption = f"📩 <b>Message from Admin</b>"
+        if extra_text:
+            full_caption += f"\n\n{extra_text}"
+
+        try:
+            if msg.photo:
+                sent = await context.bot.send_photo(
+                    chat_id=target_id,
+                    photo=msg.photo[-1].file_id,
+                    caption=full_caption,
+                    parse_mode=ParseMode.HTML,
+                    disable_notification=True,
+                )
+            elif msg.video:
+                sent = await context.bot.send_video(
+                    chat_id=target_id,
+                    video=msg.video.file_id,
+                    caption=full_caption,
+                    parse_mode=ParseMode.HTML,
+                    disable_notification=True,
+                )
+            elif msg.document:
+                sent = await context.bot.send_document(
+                    chat_id=target_id,
+                    document=msg.document.file_id,
+                    caption=full_caption,
+                    parse_mode=ParseMode.HTML,
+                    disable_notification=True,
+                )
+            else:
+                await msg.reply_text("Unsupported media type.")
+                return
+
+            track_msg(target_id, sent.message_id)
+            await msg.reply_html(f"✅ Media sent to user <code>{target_id}</code>")
+
+        except Exception as e:
+            await msg.reply_html(f"❌ Failed: {e}")
+        return
+
+    # ── /broadcast [segment] [text] ──────────────────────────────────
+    if command == "broadcast":
+        KNOWN_SEGMENTS = {"all", "unpaid"}
+
+        def is_segment(word):
+            import re
+            return word.lower() in KNOWN_SEGMENTS or bool(
+                re.match(r'^T\d+(,T\d+)*$', word, re.IGNORECASE)
+            )
+
+        second = parts[1] if len(parts) > 1 else ""
+        if is_segment(second):
+            segment = second.lower()
+            extra_text = parts[2] if len(parts) > 2 else ""
+        else:
+            segment = "all"
+            extra_text = " ".join(parts[1:])
+
+        # Get blocked IDs
+        with db() as conn:
+            blocked_ids = {r["user_id"] for r in
+                           conn.execute("SELECT user_id FROM blocked_users").fetchall()}
+            all_users = conn.execute("SELECT user_id FROM users").fetchall()
+            purchases = conn.execute(
+                "SELECT user_id, channel_id FROM purchases WHERE status='approved'"
+            ).fetchall()
+
+        tier_map = {}
+        for p in purchases:
+            uid = p["user_id"]
+            if uid not in tier_map:
+                tier_map[uid] = set()
+            tier_map[uid].add(p["channel_id"])
+
+        if segment == "all":
+            target_ids = [u["user_id"] for u in all_users]
+        elif segment == "unpaid":
+            target_ids = [u["user_id"] for u in all_users
+                          if u["user_id"] not in tier_map]
+        else:
+            try:
+                required_tiers = {
+                    int(t.replace("T", "").replace("t", ""))
+                    for t in segment.split(",")
+                }
+                target_ids = [
+                    u["user_id"] for u in all_users
+                    if any(t in tier_map.get(u["user_id"], set())
+                           for t in required_tiers)
+                ]
+            except ValueError:
+                await msg.reply_text("Invalid segment.")
+                return
+
+        target_ids = [uid for uid in target_ids if uid not in blocked_ids]
+
+        if not target_ids:
+            await msg.reply_html(
+                f"No eligible users in segment <b>{segment}</b>."
+            )
+            return
+
+        await msg.reply_html(
+            f"📢 Broadcasting media to <b>{len(target_ids)}</b> users "
+            f"(segment: <b>{segment}</b>)…"
+        )
+
+        full_caption = "📢 <b>Announcement</b>"
+        if extra_text:
+            full_caption += f"\n\n{extra_text}"
+
+        sent = failed = 0
+        for uid in target_ids:
+            try:
+                if msg.photo:
+                    m = await context.bot.send_photo(
+                        chat_id=uid,
+                        photo=msg.photo[-1].file_id,
+                        caption=full_caption,
+                        parse_mode=ParseMode.HTML,
+                        disable_notification=True,
+                    )
+                elif msg.video:
+                    m = await context.bot.send_video(
+                        chat_id=uid,
+                        video=msg.video.file_id,
+                        caption=full_caption,
+                        parse_mode=ParseMode.HTML,
+                        disable_notification=True,
+                    )
+                elif msg.document:
+                    m = await context.bot.send_document(
+                        chat_id=uid,
+                        document=msg.document.file_id,
+                        caption=full_caption,
+                        parse_mode=ParseMode.HTML,
+                        disable_notification=True,
+                    )
+                else:
+                    break
+                track_msg(uid, m.message_id)
+                sent += 1
+            except Exception as e:
+                log.debug(f"media broadcast to {uid} failed: {e}")
+                failed += 1
+
+        await msg.reply_html(
+            f"✅ <b>Media broadcast complete.</b>\n"
+            f"Segment : <b>{segment}</b>\n"
+            f"Sent    : {sent}\n"
+            f"Failed  : {failed}\n"
+            f"Skipped : {len(blocked_ids)} blocked"
+        )
+        return
+
+    await msg.reply_text(
+        "Unknown command in caption. Use /broadcast or /msg."
+    )
+
 # ==================================================================
 # ADMIN: approve / reject / request screenshot
 # ==================================================================
@@ -1722,7 +2164,7 @@ def build_reject_kb(user_id, p):
             )])
         elif owns_tier1:
             kb_rows.append([InlineKeyboardButton(
-                f"🔒 {c['name']} — ₹{c['price']}",
+                f"⭐ {c['name']} — ₹{c['price']}",
                 callback_data=f"buy:{c['id']}",
             )])
     return InlineKeyboardMarkup(kb_rows)
@@ -1790,12 +2232,22 @@ async def cb_admin(update, context):
     if not p:
         return
 
+    # Block acting on already-closed purchases
+    if action in ("approve", "reject", "reqss") and \
+            p["status"] in ("approved", "rejected"):
+        await q.answer(
+            f"Already {p['status']} — no action taken.",
+            show_alert=True
+        )
+        return
+
     user_id = p["user_id"]
     channel = next((c for c in CHANNELS if c["id"] == p["channel_id"]), None)
 
     if action == "approve":
         update_purchase(pid, status="approved",
                         approved_at=datetime.utcnow().isoformat())
+        cancel_inactivity_timer(context, user_id)
 
         # Cancel all pending animation jobs for this purchase
         for i in range(8):
@@ -1804,7 +2256,7 @@ async def cb_admin(update, context):
 
         # Build keyboard:
         #  ✅ Just-approved channel → Join URL button (single green tick)
-        #  🔒 Unowned channels → buy callback buttons
+        #  ⭐ Unowned channels → buy callback buttons
         #  Previously-owned channels are HIDDEN (user already has access).
         # + Help button at the bottom
         owned_before = get_owned_channel_ids(user_id) - {p["channel_id"]}
@@ -1833,7 +2285,7 @@ async def cb_admin(update, context):
                 else:
                     # Not owned → show as locked / buyable
                     kb_rows.append([InlineKeyboardButton(
-                        f"🔒 {c['name']} — ₹{c['price']}",
+                        f"⭐ {c['name']} — ₹{c['price']}",
                         callback_data=f"buy:{c['id']}",
                     )])
         
@@ -1961,7 +2413,7 @@ async def cb_admin(update, context):
                         if c["id"] not in owned_channel_ids:
                             price = c["price"]
                             rows.append([InlineKeyboardButton(
-                                f"🔒 {c['name']} — ₹{price}",
+                                f"⭐ {c['name']} — ₹{price}",
                                 callback_data=f"buy:{c['id']}",
                             )])
                 
@@ -1994,6 +2446,7 @@ async def cb_admin(update, context):
     elif action == "reject":
         update_purchase(pid, status="rejected",
                         rejected_at=datetime.utcnow().isoformat())
+        cancel_inactivity_timer(context, user_id)
 
         # Cancel all pending animation jobs immediately
         for i in range(8):
@@ -2559,7 +3012,7 @@ async def cmd_approve(update, context):
         with db() as conn:
             r = conn.execute("""
                 SELECT * FROM purchases
-                WHERE user_id=? AND status NOT IN ('approved','rejected','cancelled')
+                WHERE user_id=? AND status NOT IN ('approved','rejected')
                 ORDER BY id DESC LIMIT 1
             """, (user_id,)).fetchone()
         p = dict(r) if r else None
@@ -2581,6 +3034,7 @@ async def cmd_approve(update, context):
     # Mark approved
     update_purchase(pid, status="approved",
                     approved_at=datetime.utcnow().isoformat())
+    cancel_inactivity_timer(context, user_id)
 
     # Build approval keyboard
     owned_before = get_owned_channel_ids(user_id) - {p["channel_id"]}
@@ -2603,7 +3057,7 @@ async def cmd_approve(update, context):
                 continue
             else:
                 kb_rows.append([InlineKeyboardButton(
-                    f"🔒 {c['name']} — ₹{c['price']}",
+                    f"⭐ {c['name']} — ₹{c['price']}",
                     callback_data=f"buy:{c['id']}",
                 )])
 
@@ -2710,7 +3164,7 @@ async def cmd_reject(update, context):
         with db() as conn:
             r = conn.execute("""
                 SELECT * FROM purchases
-                WHERE user_id=? AND status NOT IN ('approved','rejected','cancelled')
+                WHERE user_id=? AND status NOT IN ('approved','rejected')
                 ORDER BY id DESC LIMIT 1
             """, (user_id,)).fetchone()
         p = dict(r) if r else None
@@ -2732,6 +3186,7 @@ async def cmd_reject(update, context):
     # Mark rejected
     update_purchase(pid, status="rejected",
                     rejected_at=datetime.utcnow().isoformat())
+    cancel_inactivity_timer(context, user_id)
 
     rejection_text = "❌ <b>REJECTED</b>\n\n<i>Payment not verified.</i>"
     reject_kb = build_reject_kb(user_id, p)
@@ -5017,6 +5472,13 @@ def main():
     ))
     app.add_handler(CommandHandler("restore",     cmd_restore))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^adm:"))
+    app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.VIDEO | filters.Document.ALL)
+        & filters.ChatType.PRIVATE
+        & filters.User(ADMIN_ID),
+        on_admin_media,
+    ))
+
 
     jq = app.job_queue
     jq.run_daily(
