@@ -1193,29 +1193,25 @@ async def cmd_start(update, context):
         intro = f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
         intro += f"<b>You have access to your purchased content.</b>"
         
-        # Show owned channels first (green ✅)
+        # Single pass — owned = ✅ direct link, unowned = 🔒 buy button
+        # Unowned channels are NEVER hidden — user can always purchase more
         for c in CHANNELS:
             if c["id"] in owned_channel_ids:
                 rows.append([InlineKeyboardButton(
                     f"✅ {c['name']}", url=c["link"]
                 )])
-        
-        # Show owned bundles (green ✅)
+            else:
+                rows.append([InlineKeyboardButton(
+                    f"🔒 {c['name']} — ₹{c['price']}",
+                    callback_data=f"buy:{c['id']}",
+                )])
+
+        # Owned bundles — single ✅ button → direct bundle link
         for price in sorted(owned_bundle_prices):
             if price in BUNDLES:
                 bundle = BUNDLES[price]
                 rows.append([InlineKeyboardButton(
                     f"✅ {bundle['name']}", url=bundle["link"]
-                )])
-        
-        # Show unowned channels as upgrades (locked ⭐) — use base price for consistency
-        for c in CHANNELS:
-            if c["id"] not in owned_channel_ids:
-                # Use base channel price (same as initial offer for consistency)
-                price = c["price"]
-                rows.append([InlineKeyboardButton(
-                    f"⭐ {c['name']} — ₹{price}",
-                    callback_data=f"buy:{c['id']}",
                 )])
 
 
@@ -2236,18 +2232,15 @@ async def cb_admin(update, context):
                     f"✅ {bundle['name']} — Join", url=bundle["link"]
                 )])
         else:
-            # REGULAR CHANNEL APPROVED
+            # All owned channels (just-approved + previously owned) → single ✅ button
+            # All unowned channels → ⭐ buy button, always visible
+            all_owned = get_owned_channel_ids(user_id)
             for c in CHANNELS:
-                if c["id"] == p["channel_id"]:
-                    # The channel just approved → green tick + Join
+                if c["id"] in all_owned:
                     kb_rows.append([InlineKeyboardButton(
-                        f"✅ {c['name']} — Join", url=c["link"]
+                        f"✅ {c['name']}", url=c["link"]
                     )])
-                elif c["id"] in owned_before:
-                    # Already owned from a previous purchase → don't show
-                    continue
                 else:
-                    # Not owned → show as locked / buyable
                     kb_rows.append([InlineKeyboardButton(
                         f"⭐ {c['name']} — ₹{c['price']}",
                         callback_data=f"buy:{c['id']}",
@@ -2349,36 +2342,33 @@ async def cb_admin(update, context):
                     )])
                     if is_fallback_enabled():
                         rows.append([InlineKeyboardButton(
-                            "⭐⭐ MALLU PREMIUM - ₹299 ⭐⭐", callback_data="fallback_menu"
+                            "📦 See Budget Bundles", callback_data="fallback_menu"
                         )])
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
                 else:
-                    # User now has access — show updated menu with new purchase
+                    # Owned channels → single ✅ button → direct channel link
+                    # Unowned channels → 🔒 buy button, always visible
                     intro = f"👋 <b>Welcome back!</b>\n\n<b>You have access to your purchased content.</b>"
-                    
-                    # Show owned channels
+
                     for c in CHANNELS:
                         if c["id"] in owned_channel_ids:
                             rows.append([InlineKeyboardButton(
                                 f"✅ {c['name']}", url=c["link"]
                             )])
-                    
-                    # Show owned bundles
-                    for price in sorted(owned_bundle_prices):
-                        if price in BUNDLES:
-                            bundle = BUNDLES[price]
-                            rows.append([InlineKeyboardButton(
-                                f"✅ {bundle['name']}", url=bundle["link"]
-                            )])
-                    
-                    # Show upgrades
-                    for c in CHANNELS:
-                        if c["id"] not in owned_channel_ids:
+                        else:
                             price = c["price"]
                             rows.append([InlineKeyboardButton(
-                                f"⭐ {c['name']} — ₹{price}",
+                                f"🔒 {c['name']} — ₹{price}",
                                 callback_data=f"buy:{c['id']}",
+                            )])
+
+                    # Owned bundles
+                    for price in sorted(owned_bundle_prices):
+                        if price in BUNDLES:
+                            bundle = BUNDLES[bundle_price]
+                            rows.append([InlineKeyboardButton(
+                                f"✅ {bundle['name']}", url=bundle["link"]
                             )])
                 
                 # Try to refresh the menu in-place (live update)
