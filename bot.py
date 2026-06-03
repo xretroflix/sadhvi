@@ -1240,8 +1240,12 @@ async def cmd_start(update, context):
             log.debug(f"menu edit failed, will send fresh: {e}")
 
     if not edited:
-        # Clean up any tracked messages from previous flow first
-        await clear_tracked(context, user.id)
+        # Only wipe tracked messages for unpaid users mid-flow.
+        # For paid users, never clear — their ✅ Join buttons and approval
+        # messages must remain permanently visible across /start calls.
+        if not paid_t1:
+            await clear_tracked(context, user.id)
+
         m = await context.bot.send_message(
             chat_id=user.id, text=intro, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(rows),
@@ -1249,7 +1253,7 @@ async def cmd_start(update, context):
             disable_notification=True,
         )
         track_msg(user.id, m.message_id)
-        # Save as menu message so future /start can edit it
+        # Save as menu message so future /start can edit it in-place
         with db() as conn:
             conn.execute("UPDATE users SET menu_msg_id=? WHERE user_id=?",
                          (m.message_id, user.id))
@@ -1382,7 +1386,6 @@ async def cb_buy_bundle(update, context):
                   f"⏳ Awaiting payment proof…"),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=admin_action_kb(pid),
         )
     except Exception as e:
         log.error(f"Admin notify failed: {e}")
@@ -1529,7 +1532,6 @@ async def cb_buy(update, context):
                   f"⏳ Awaiting payment proof…"),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=admin_action_kb(pid),
         )
     except Exception as e:
         log.error(f"Admin notify failed: {e}")
