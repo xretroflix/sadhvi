@@ -1332,7 +1332,7 @@ async def cb_buy_bundle(update, context):
         conn.execute("UPDATE users SET menu_msg_id=NULL WHERE user_id=?", (user.id,))
     await clear_tracked(context, user.id)
     
-    # Step 1 — Send QR photo only, no button
+    # Step 1 + Step 2 sent back-to-back — no DB calls in between
     with open(qr_path, "rb") as fh:
         qr_msg = await context.bot.send_photo(
             chat_id=user.id, photo=fh,
@@ -1343,17 +1343,14 @@ async def cb_buy_bundle(update, context):
             parse_mode=ParseMode.HTML,
             disable_notification=True,
         )
-    track_msg(user.id, qr_msg.message_id)
-    update_purchase(pid, qr_downloaded_at=datetime.utcnow().isoformat())
 
-    # Step 2 — Separate message with button so user can't miss it
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
     ]])
     pay_msg = await context.bot.send_message(
         chat_id=user.id,
         text=(
-            f"💳 <b>Pay ₹{channel['price']}</b> using the QR above.\n\n"
+            f"💳 <b>Pay ₹{bundle_price}</b> using the QR above.\n\n"
             f"<b>STEP 2</b> — After payment is done, tap the button below 👇"
         ),
         parse_mode=ParseMode.HTML,
@@ -1361,8 +1358,12 @@ async def cb_buy_bundle(update, context):
         protect_content=True,
         disable_notification=True,
     )
+
+    # DB updates after both messages are delivered
+    track_msg(user.id, qr_msg.message_id)
     track_msg(user.id, pay_msg.message_id)
-    update_purchase(pid, main_msg_id=pay_msg.message_id)
+    update_purchase(pid, main_msg_id=pay_msg.message_id,
+                    qr_downloaded_at=datetime.utcnow().isoformat())
 
     # Schedule QR expiry on the QR photo message
     if QR_EXPIRY_MINUTES > 0:
@@ -1720,20 +1721,6 @@ async def forward_user_message_to_admin(update, context, user):
     except Exception as e:
         log.error(f"forward_user_message_to_admin failed: {e}")
 
-    # Send acknowledgement to user so they know message was received
-    try:
-        ack = await context.bot.send_message(
-            chat_id=user.id,
-            text="📨 <b>Message received.</b>\n\nAdmin will get back to you shortly.",
-            parse_mode=ParseMode.HTML,
-            disable_notification=True,
-        )
-        track_msg(user.id, ack.message_id)
-        # Auto-delete ack after 30s — keeps chat clean
-        schedule_auto_delete(context, user.id, ack.message_id, delay_seconds=30)
-    except Exception as e:
-        log.debug(f"ack to user failed: {e}")
-
 
 async def on_text_message(update, context):
     user = update.effective_user
@@ -1897,19 +1884,6 @@ async def on_photo(update, context):
             )
         except Exception as e:
             log.error(f"forward unsolicited photo failed: {e}")
-
-        # Ack to user
-        try:
-            ack = await context.bot.send_message(
-                chat_id=user.id,
-                text="📨 <b>Photo received.</b>\n\nAdmin will get back to you shortly.",
-                parse_mode=ParseMode.HTML,
-                disable_notification=True,
-            )
-            track_msg(user.id, ack.message_id)
-            schedule_auto_delete(context, user.id, ack.message_id, delay_seconds=30)
-        except Exception as e:
-            log.debug(f"ack photo to user failed: {e}")
         return
 
     file_id = update.message.photo[-1].file_id
