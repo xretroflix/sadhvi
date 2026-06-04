@@ -1234,11 +1234,16 @@ async def cmd_start(update, context):
             edited = True
         except Exception as e:
             log.debug(f"menu edit failed, will send fresh: {e}")
+            # Delete the stale menu message so it doesn't stack
+            await safe_delete(context, user.id, existing_id)
+            with db() as conn:
+                conn.execute(
+                    "UPDATE users SET menu_msg_id=NULL WHERE user_id=?",
+                    (user.id,))
 
     if not edited:
-        # Only wipe tracked messages for unpaid users mid-flow.
-        # For paid users, never clear — their ✅ Join buttons and approval
-        # messages must remain permanently visible across /start calls.
+        # Only wipe mid-flow tracked messages for unpaid users.
+        # Paid users keep their ✅ approval messages intact.
         if not paid_t1:
             await clear_tracked(context, user.id)
 
@@ -1249,7 +1254,6 @@ async def cmd_start(update, context):
             disable_notification=True,
         )
         track_msg(user.id, m.message_id)
-        # Save as menu message so future /start can edit it in-place
         with db() as conn:
             conn.execute("UPDATE users SET menu_msg_id=? WHERE user_id=?",
                          (m.message_id, user.id))
