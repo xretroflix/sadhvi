@@ -1234,19 +1234,45 @@ async def cmd_start(update, context):
             edited = True
         except Exception as e:
             log.debug(f"menu edit failed, will send fresh: {e}")
-            # Delete the stale menu message so it doesn't stack
-            await safe_delete(context, user.id, existing_id)
-            with db() as conn:
-                conn.execute(
-                    "UPDATE users SET menu_msg_id=NULL WHERE user_id=?",
-                    (user.id,))
 
     if not edited:
-        # Only wipe mid-flow tracked messages for unpaid users.
-        # Paid users keep their ✅ approval messages intact.
-        if not paid_t1:
-            await clear_tracked(context, user.id)
+        # Wipe ALL old bot messages before sending fresh /start.
+        # This covers: old menu, approval messages, QR messages,
+        # verifying messages, admin messages — everything.
+        # Safe for paid users because ✅ buttons are rebuilt from
+        # DB queries, not from the old approval message.
 
+        # 1. Delete stale menu message
+        if existing_id:
+            await safe_delete(context, user.id, existing_id)
+
+        # 2. Delete all tracked messages (approval, QR, verifying, etc.)
+        tracked = get_tracked_msgs(user.id)
+        for mid in tracked:
+            if mid != existing_id:  # already deleted above
+                await safe_delete(context, user.id, mid)
+
+        # 3. Delete any main_msg_id from purchases (approval messages)
+        with db() as conn:
+            purchase_msgs = conn.execute(
+                "SELECT main_msg_id FROM purchases WHERE user_id=?",
+                (user.id,)
+            ).fetchall()
+        for row in purchase_msgs:
+            if row["main_msg_id"] and row["main_msg_id"] not in tracked \
+                    and row["main_msg_id"] != existing_id:
+                await safe_delete(context, user.id, row["main_msg_id"])
+
+        # 4. Reset all message refs in DB
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' "
+                "WHERE user_id=?", (user.id,))
+            conn.execute(
+                "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
+                (user.id,))
+
+        # 5. Send fresh /start menu
         m = await context.bot.send_message(
             chat_id=user.id, text=intro, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(rows),
