@@ -1818,13 +1818,21 @@ async def on_text_message(update, context):
 
 async def animate_verifying(context):
     data = context.job.data
+    # First check
     p = get_purchase(data["purchase_id"])
     if not p or p["status"] != "verifying":
-        return  # admin already acted, stop animating
-    # Re-fetch right before API call — closes the race window where admin
-    # rejects while this coroutine is mid-flight
+        return
+    # Second check right before the API call — if admin approved/rejected
+    # between these two lines, this edit will either fail (message deleted)
+    # or be immediately overwritten by reconfirm_approval job
     p = get_purchase(data["purchase_id"])
     if not p or p["status"] != "verifying":
+        return
+    # Only edit if message still exists (not deleted by approval flow)
+    if not p.get("main_msg_id"):
+        return
+    if p["main_msg_id"] != data["msg_id"]:
+        # Message was replaced by a new one — stop animating old message
         return
     await edit_main(context, data["user_id"], data["msg_id"],
                     f"⏳ <b>VERIFYING{data['dots']}</b>\n\n"
@@ -2268,37 +2276,91 @@ async def cb_admin(update, context):
             # CHANNEL
             approval_text += f"✅ <b>{p.get('channel_name', 'Channel')}</b>"
 
-        # Try to edit the existing main message in-place first (clean UX)
-        delivered = False
+        # Step 1 — Cancel ALL animation jobs before touching the message
+        for i in range(8):
+            for job in context.job_queue.get_jobs_by_name(
+                    f"anim_{user_id}_{pid}_{i}"):
+                job.schedule_removal()
+
+        # Step 2 — Delete the verifying message entirely instead of editing.
+        # Editing is unreliable when an in-flight animation coroutine may
+        # complete after us and overwrite the approval. Deletion is atomic
+        # and guarantees the VERIFYING message is gone permanently.
         if p.get("main_msg_id"):
-            delivered = await edit_main(
-                context, user_id, p["main_msg_id"],
-                approval_text, reply_markup=kb,
+            await safe_delete(context, user_id, p["main_msg_id"])
+            update_purchase(pid, main_msg_id=None)
+
+        # Step 3 — Send a brand-new approval message that can never be
+        # overwritten because the old message_id no longer exists.
+        delivered = False
+        try:
+            m = await context.bot.send_message(
+                chat_id=user_id,
+                text=approval_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                protect_content=True,
+                disable_notification=True,
+            )
+            track_msg(user_id, m.message_id)
+            update_purchase(pid, main_msg_id=m.message_id)
+            delivered = True
+        except Exception as e:
+            log.error(f"approve delivery failed: {e}")
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Couldn't deliver approval to user "
+                    f"<code>{user_id}</code> ({p['channel_name']}). "
+                    f"Open chat manually: tg://user?id={user_id}",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        # Step 4 — Re-confirm at 5s and 12s to catch any edge case where
+        # an animation coroutine was already mid-flight before cancellation.
+        # Uses the new message_id so it can never hit the deleted message.
+        async def reconfirm_approval(ctx):
+            rp = get_purchase(pid)
+            if not rp or rp["status"] != "approved":
+                return
+            if not rp.get("main_msg_id"):
+                return
+            # Rebuild keyboard fresh from DB
+            all_owned = get_owned_channel_ids(user_id)
+            fresh_rows = []
+            if rp["channel_id"] == 0:
+                bp = rp["amount"]
+                if bp in BUNDLES:
+                    fresh_rows.append([InlineKeyboardButton(
+                        f"✅ {BUNDLES[bp]['name']}", url=BUNDLES[bp]["link"]
+                    )])
+            else:
+                for c in CHANNELS:
+                    if c["id"] in all_owned:
+                        fresh_rows.append([InlineKeyboardButton(
+                            f"✅ {c['name']}", url=c["link"]
+                        )])
+                    else:
+                        fresh_rows.append([InlineKeyboardButton(
+                            f"🔒 {c['name']} — ₹{c['price']}",
+                            callback_data=f"buy:{c['id']}",
+                        )])
+            await edit_main(
+                ctx, user_id, rp["main_msg_id"],
+                approval_text,
+                reply_markup=InlineKeyboardMarkup(fresh_rows),
             )
 
-        # If edit failed, send a fresh message
-        if not delivered:
-            try:
-                m = await context.bot.send_message(
-                    chat_id=user_id, text=approval_text,
-                    parse_mode=ParseMode.HTML, reply_markup=kb,
-                    protect_content=True, disable_notification=True,
-                )
-                track_msg(user_id, m.message_id)
-                update_purchase(pid, main_msg_id=m.message_id)
-                delivered = True
-            except Exception as e:
-                log.error(f"approve delivery failed: {e}")
-                try:
-                    await context.bot.send_message(
-                        ADMIN_ID,
-                        f"⚠️ Couldn't deliver approval to user "
-                        f"<code>{user_id}</code> ({p['channel_name']}). "
-                        f"Open chat manually: tg://user?id={user_id}",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
+        context.job_queue.run_once(
+            reconfirm_approval, when=5,
+            name=f"reconfirm_approve_{pid}_1"
+        )
+        context.job_queue.run_once(
+            reconfirm_approval, when=12,
+            name=f"reconfirm_approve_{pid}_2"
+        )
 
         # LIVE STATE REFRESH: Update user's /start menu immediately (if they have one)
         # This ensures the user sees their updated state without needing to tap /start again
