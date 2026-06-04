@@ -3072,18 +3072,44 @@ async def cmd_approve(update, context):
 
     pid = p["id"]
 
-    # Cancel any animation jobs
+    # Step 1 — Cancel animation and inactivity jobs immediately
     for i in range(8):
         for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
             job.schedule_removal()
-
-    # Mark approved
-    update_purchase(pid, status="approved",
-                    approved_at=datetime.utcnow().isoformat())
     cancel_inactivity_timer(context, user_id)
 
-    # Build approval keyboard
-    owned_before = get_owned_channel_ids(user_id) - {p["channel_id"]}
+    # Step 2 — Mark approved
+    update_purchase(pid, status="approved",
+                    approved_at=datetime.utcnow().isoformat())
+
+    # Step 3 — Wipe entire user chat (QR, Step 2 button, verifying, etc.)
+    all_ids = set()
+    all_ids.update(get_tracked_msgs(user_id))
+    with db() as conn:
+        u_row_db = conn.execute(
+            "SELECT menu_msg_id FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if u_row_db and u_row_db["menu_msg_id"]:
+            all_ids.add(u_row_db["menu_msg_id"])
+        all_purchases = conn.execute(
+            "SELECT main_msg_id FROM purchases WHERE user_id=?", (user_id,)
+        ).fetchall()
+        for row in all_purchases:
+            if row["main_msg_id"]:
+                all_ids.add(row["main_msg_id"])
+    for mid in all_ids:
+        await safe_delete(context, user_id, mid)
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' "
+            "WHERE user_id=?", (user_id,))
+        conn.execute(
+            "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
+            (user_id,))
+
+    # Step 4 — Build fresh approval keyboard from DB
+    # All owned channels → ✅ direct link, all unowned → 🔒 buy button
+    all_owned = get_owned_channel_ids(user_id)
     kb_rows = []
 
     if p["channel_id"] == 0:
@@ -3091,47 +3117,44 @@ async def cmd_approve(update, context):
         if bundle_price in BUNDLES:
             bundle = BUNDLES[bundle_price]
             kb_rows.append([InlineKeyboardButton(
-                f"✅ {bundle['name']} — Join", url=bundle["link"]
+                f"✅ {bundle['name']}", url=bundle["link"]
             )])
     else:
         for c in CHANNELS:
-            if c["id"] == p["channel_id"]:
+            if c["id"] in all_owned:
                 kb_rows.append([InlineKeyboardButton(
-                    f"✅ {c['name']} — Join", url=c["link"]
+                    f"✅ {c['name']}", url=c["link"]
                 )])
-            elif c["id"] in owned_before:
-                continue
             else:
                 kb_rows.append([InlineKeyboardButton(
-                    f"⭐ {c['name']} — ₹{c['price']}",
+                    f"🔒 {c['name']} — ₹{c['price']}",
                     callback_data=f"buy:{c['id']}",
                 )])
 
     kb = InlineKeyboardMarkup(kb_rows)
-    approval_text = f"🎉 <b>APPROVED</b>\n\n✅ <b>{p.get('channel_name', 'Channel')}</b>"
+    approval_text = (
+        f"🎉 <b>APPROVED</b>\n\n"
+        f"✅ <b>{p.get('channel_name', 'Channel')}</b>\n\n"
+        f"<b>You have access to your purchased content.</b>\n"
+        f"Tap the button below to join 👇"
+    )
 
-    # Deliver to user
+    # Step 5 — Send guaranteed fresh approval message
     delivered = False
-    if p.get("main_msg_id"):
-        delivered = await edit_main(
-            context, user_id, p["main_msg_id"],
-            approval_text, reply_markup=kb,
+    try:
+        m = await context.bot.send_message(
+            chat_id=user_id,
+            text=approval_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            protect_content=True,
+            disable_notification=True,
         )
-    if not delivered:
-        try:
-            m = await context.bot.send_message(
-                chat_id=user_id,
-                text=approval_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                protect_content=True,
-                disable_notification=True,
-            )
-            track_msg(user_id, m.message_id)
-            update_purchase(pid, main_msg_id=m.message_id)
-            delivered = True
-        except Exception as e:
-            log.error(f"cmd_approve delivery failed: {e}")
+        track_msg(user_id, m.message_id)
+        update_purchase(pid, main_msg_id=m.message_id)
+        delivered = True
+    except Exception as e:
+        log.error(f"cmd_approve delivery failed: {e}")
 
     schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
     await event_backup(context)
@@ -3224,40 +3247,61 @@ async def cmd_reject(update, context):
 
     pid = p["id"]
 
-    # Cancel animation jobs
+    # Step 1 — Cancel animation and inactivity jobs immediately
     for i in range(8):
         for job in context.job_queue.get_jobs_by_name(f"anim_{user_id}_{pid}_{i}"):
             job.schedule_removal()
-
-    # Mark rejected
-    update_purchase(pid, status="rejected",
-                    rejected_at=datetime.utcnow().isoformat())
     cancel_inactivity_timer(context, user_id)
 
+    # Step 2 — Mark rejected
+    update_purchase(pid, status="rejected",
+                    rejected_at=datetime.utcnow().isoformat())
+
+    # Step 3 — Wipe entire user chat (QR, Step 2 button, verifying, etc.)
+    all_ids = set()
+    all_ids.update(get_tracked_msgs(user_id))
+    with db() as conn:
+        u_row_db = conn.execute(
+            "SELECT menu_msg_id FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if u_row_db and u_row_db["menu_msg_id"]:
+            all_ids.add(u_row_db["menu_msg_id"])
+        all_purchases = conn.execute(
+            "SELECT main_msg_id FROM purchases WHERE user_id=?", (user_id,)
+        ).fetchall()
+        for row in all_purchases:
+            if row["main_msg_id"]:
+                all_ids.add(row["main_msg_id"])
+    for mid in all_ids:
+        await safe_delete(context, user_id, mid)
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' "
+            "WHERE user_id=?", (user_id,))
+        conn.execute(
+            "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
+            (user_id,))
+
+    # Step 4 — Build rejection keyboard fresh
     rejection_text = "❌ <b>REJECTED</b>\n\n<i>Payment not verified.</i>"
     reject_kb = build_reject_kb(user_id, p)
 
+    # Step 5 — Send guaranteed fresh rejection message
     delivered = False
-    if p.get("main_msg_id"):
-        delivered = await edit_main(
-            context, user_id, p["main_msg_id"],
-            rejection_text, reply_markup=reject_kb,
+    try:
+        m = await context.bot.send_message(
+            chat_id=user_id,
+            text=rejection_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reject_kb,
+            protect_content=True,
+            disable_notification=True,
         )
-    if not delivered:
-        try:
-            m = await context.bot.send_message(
-                chat_id=user_id,
-                text=rejection_text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reject_kb,
-                protect_content=True,
-                disable_notification=True,
-            )
-            track_msg(user_id, m.message_id)
-            update_purchase(pid, main_msg_id=m.message_id)
-            delivered = True
-        except Exception as e:
-            log.error(f"cmd_reject delivery failed: {e}")
+        track_msg(user_id, m.message_id)
+        update_purchase(pid, main_msg_id=m.message_id)
+        delivered = True
+    except Exception as e:
+        log.error(f"cmd_reject delivery failed: {e}")
 
     schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
     await event_backup(context)
