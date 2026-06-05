@@ -245,6 +245,21 @@ def init_db():
                 position    INTEGER DEFAULT 0,
                 created_at  TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS qr_codes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                file_id     TEXT NOT NULL,
+                upi_label   TEXT,
+                is_active   INTEGER DEFAULT 1,
+                priority    INTEGER DEFAULT 1,
+                position    INTEGER DEFAULT 0,
+                use_count   INTEGER DEFAULT 0,
+                created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS qr_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
         """)
         # Migration safety: add columns if upgrading from v2/v3
         try:
@@ -261,6 +276,10 @@ def init_db():
             pass
         try:
             conn.execute("ALTER TABLE channel_visibility ADD COLUMN custom_price INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE purchases ADD COLUMN qr_code_id INTEGER")
         except sqlite3.OperationalError:
             pass
 
@@ -1525,6 +1544,91 @@ def log_sleep_visitor(user):
             VALUES (?, ?, ?, ?)
         """, (user.id, user.first_name, user.last_name, user.username))
 
+def get_qr_mode() -> str:
+    """round_robin | priority | single — default priority."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM qr_settings WHERE key='qr_mode'"
+        ).fetchone()
+    return r["value"] if r else "priority"
+
+def set_qr_mode(mode: str):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO qr_settings (key, value) "
+            "VALUES ('qr_mode', ?)", (mode,)
+        )
+
+def get_rr_index() -> int:
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM qr_settings WHERE key='rr_index'"
+        ).fetchone()
+    return int(r["value"]) if r else 0
+
+def set_rr_index(idx: int):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO qr_settings (key, value) "
+            "VALUES ('rr_index', ?)", (str(idx),)
+        )
+
+def get_active_single_qr_id() -> int | None:
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM qr_settings WHERE key='active_qr_id'"
+        ).fetchone()
+    return int(r["value"]) if r else None
+
+def set_active_single_qr_id(qr_id: int):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO qr_settings (key, value) "
+            "VALUES ('active_qr_id', ?)", (str(qr_id),)
+        )
+
+def pick_qr_code() -> dict | None:
+    """Pick a QR code dict based on current routing mode.
+    Returns None if no QR codes in DB — caller falls back to env var QRs."""
+    with db() as conn:
+        active_qrs = conn.execute("""
+            SELECT id, name, file_id, upi_label, priority, position
+            FROM qr_codes
+            WHERE is_active=1
+            ORDER BY position ASC, id ASC
+        """).fetchall()
+
+    if not active_qrs:
+        return None
+
+    active_qrs = [dict(r) for r in active_qrs]
+    mode = get_qr_mode()
+
+    if mode == "single":
+        selected_id = get_active_single_qr_id()
+        selected = next(
+            (q for q in active_qrs if q["id"] == selected_id),
+            active_qrs[0]  # fallback to first if selected ID not found
+        )
+
+    elif mode == "round_robin":
+        idx = get_rr_index() % len(active_qrs)
+        selected = active_qrs[idx]
+        set_rr_index(idx + 1)
+
+    else:  # priority (default)
+        weights = [max(q["priority"], 1) for q in active_qrs]
+        selected = random.choices(active_qrs, weights=weights, k=1)[0]
+
+    # Track usage
+    with db() as conn:
+        conn.execute(
+            "UPDATE qr_codes SET use_count=use_count+1 WHERE id=?",
+            (selected["id"],)
+        )
+
+    return selected
+
 # ==================================================================
 # USER: /start
 # ==================================================================
@@ -1910,21 +2014,27 @@ async def cb_buy_bundle(update, context):
         return
     
     # Pick QR code
-    qr_idx = pick_qr()
-    qr_path = QR_FILES[qr_idx]
-    
-    if not os.path.exists(qr_path):
-        await context.bot.send_message(
-            user.id,
-            "⚠️ QR code not available. Please contact admin.",
-            disable_notification=True,
-        )
-        return
-    
-    # Create purchase record for bundle
-    # Bundle: channel_id=0, name includes price, amount=bundle_price
+    qr_db = pick_qr_code()
     bundle_channel = {"id": 0, "name": f"Bundle (₹{bundle_price})", "price": bundle_price}
-    pid = create_purchase(user.id, bundle_channel, qr_idx)
+    pid = create_purchase(user.id, bundle_channel, 0)
+
+    if qr_db:
+        update_purchase(pid, qr_code_id=qr_db["id"])
+        qr_photo = qr_db["file_id"]
+        qr_source = "file_id"
+    else:
+        qr_idx = pick_qr()
+        qr_path = QR_FILES[qr_idx]
+        update_purchase(pid, qr_used=qr_idx)
+        if not os.path.exists(qr_path):
+            await context.bot.send_message(
+                user.id,
+                "⚠️ QR code not available. Please contact admin.",
+                disable_notification=True,
+            )
+            return
+        qr_photo = qr_path
+        qr_source = "file"
     
     # Delete the menu message (transitioning to QR flow)
     try:
@@ -1940,19 +2050,28 @@ async def cb_buy_bundle(update, context):
         InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
     ]])
 
-    with open(qr_path, "rb") as fh:
+    caption = (
+        f"💳 <b>Pay ₹{bundle_price}</b> via UPI\n\n"
+        f"📲 <b>STEP 1</b> — Tap image → top-right <b>⋮</b> → "
+        f"<b>Share</b> → choose UPI app\n\n"
+        f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
+    )
+
+    if qr_source == "file_id":
         qr_msg = await context.bot.send_photo(
-            chat_id=user.id, photo=fh,
-            caption=(
-                f"💳 <b>Pay ₹{bundle_price}</b> via UPI\n\n"
-                f"📲 <b>STEP 1</b> — Tap image → top-right <b>⋮</b> → "
-                f"<b>Share</b> → choose UPI app\n\n"
-                f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
-            ),
-            parse_mode=ParseMode.HTML,
+            chat_id=user.id, photo=qr_photo,
+            caption=caption, parse_mode=ParseMode.HTML,
             reply_markup=kb,
             disable_notification=True,
         )
+    else:
+        with open(qr_photo, "rb") as fh:
+            qr_msg = await context.bot.send_photo(
+                chat_id=user.id, photo=fh,
+                caption=caption, parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_notification=True,
+            )
 
     track_msg(user.id, qr_msg.message_id)
     update_purchase(pid, main_msg_id=qr_msg.message_id,
@@ -2053,23 +2172,39 @@ async def cb_buy(update, context):
             pass
         return
 
-    qr_idx = pick_qr()
-    qr_path = QR_FILES[qr_idx]
-    pid = create_purchase(user.id, channel, qr_idx)
+    # Try DB QR codes first, fall back to env var file paths
+    qr_db = pick_qr_code()
+    pid = create_purchase(user.id, channel, 0)
 
-    if not os.path.exists(qr_path):
-        m = await context.bot.send_message(
-            user.id, "⚠️ Payment QR not configured. Please contact admin.",
-            protect_content=True,
-            disable_notification=True,
-        )
-        track_msg(user.id, m.message_id)
-        try:
-            await context.bot.send_message(
-                ADMIN_ID, f"⚠️ QR missing at {qr_path}. User {user.id} blocked."
+    if qr_db:
+        # DB-managed QR — use Telegram file_id directly
+        update_purchase(pid, qr_code_id=qr_db["id"])
+        qr_photo = qr_db["file_id"]
+        qr_source = "file_id"
+    else:
+        # Fallback to env var QR files
+        qr_idx = pick_qr()
+        qr_path = QR_FILES[qr_idx]
+        update_purchase(pid, qr_used=qr_idx)
+        if not os.path.exists(qr_path):
+            m = await context.bot.send_message(
+                user.id,
+                "⚠️ Payment QR not configured. Please contact admin.",
+                protect_content=True,
+                disable_notification=True,
             )
-        except Exception: pass
-        return
+            track_msg(user.id, m.message_id)
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ No QR codes in DB and file missing at {qr_path}. "
+                    f"Use /qr_add to upload a QR."
+                )
+            except Exception:
+                pass
+            return
+        qr_photo = qr_path
+        qr_source = "file"
 
     # Delete the menu message (we're transitioning to the QR flow).
     # Clear menu_msg_id since it no longer exists.
@@ -2093,19 +2228,28 @@ async def cb_buy(update, context):
         InlineKeyboardButton("✅ I've Paid — Click Here", callback_data=f"upi:start:{pid}")
     ]])
 
-    with open(qr_path, "rb") as fh:
+    caption = (
+        f"💳 <b>Pay ₹{channel['price']}</b> via UPI\n\n"
+        f"📲 <b>STEP 1</b> — Tap image → top-right <b>⋮</b> → "
+        f"<b>Share</b> → choose UPI app\n\n"
+        f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
+    )
+
+    if qr_source == "file_id":
         qr_msg = await context.bot.send_photo(
-            chat_id=user.id, photo=fh,
-            caption=(
-                f"💳 <b>Pay ₹{channel['price']}</b> via UPI\n\n"
-                f"📲 <b>STEP 1</b> — Tap image → top-right <b>⋮</b> → "
-                f"<b>Share</b> → choose UPI app\n\n"
-                f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
-            ),
-            parse_mode=ParseMode.HTML,
+            chat_id=user.id, photo=qr_photo,
+            caption=caption, parse_mode=ParseMode.HTML,
             reply_markup=kb,
             disable_notification=True,
         )
+    else:
+        with open(qr_photo, "rb") as fh:
+            qr_msg = await context.bot.send_photo(
+                chat_id=user.id, photo=fh,
+                caption=caption, parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_notification=True,
+            )
 
     track_msg(user.id, qr_msg.message_id)
     update_purchase(pid, main_msg_id=qr_msg.message_id,
@@ -2614,6 +2758,42 @@ async def on_admin_media(update, context):
     # Parse first word as command
     parts = caption.split(maxsplit=2)
     command = parts[0].lower().lstrip("/")
+
+    # ── /qr_add <name> [priority] ────────────────────────────────────
+    if command == "qr_add":
+        if not msg.photo:
+            await msg.reply_text("Send a photo with caption /qr_add <name>")
+            return
+
+        name_parts = parts[1:]
+        priority = 1
+        if name_parts and name_parts[-1].isdigit():
+            priority = int(name_parts[-1])
+            name = " ".join(name_parts[:-1]) or "QR"
+        else:
+            name = " ".join(name_parts) if name_parts else "QR"
+
+        file_id = msg.photo[-1].file_id
+
+        with db() as conn:
+            max_pos = conn.execute(
+                "SELECT COALESCE(MAX(position), 0) m FROM qr_codes"
+            ).fetchone()["m"]
+            cur = conn.execute("""
+                INSERT INTO qr_codes (name, file_id, priority, position)
+                VALUES (?, ?, ?, ?)
+            """, (name, file_id, priority, max_pos + 1))
+            new_id = cur.lastrowid
+
+        await msg.reply_html(
+            f"✅ <b>QR Code Added</b>\n\n"
+            f"ID       : <code>{new_id}</code>\n"
+            f"Name     : {name}\n"
+            f"Priority : {priority}\n\n"
+            f"<i>Use /qr_list to see all QRs.\n"
+            f"Use /qr_mode to change routing.</i>"
+        )
+        return
 
     # ── /msg user_id [text] ──────────────────────────────────────────
     if command == "msg":
@@ -3961,6 +4141,420 @@ async def cmd_reject(update, context):
         f"Delivered: {'✅ Yes' if delivered else '❌ Failed — user may need to /start'}"
     )
 
+async def cmd_qr_add(update, context):
+    """Admin: Send a photo to the bot with caption /qr_add <name> [priority]
+
+    Uploads a QR code and stores it by Telegram file_id.
+    No file storage needed — works across restarts.
+
+    Examples (send as photo caption):
+    /qr_add Main QR
+    /qr_add Backup QR 2
+    /qr_add VIP QR 5
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    msg = update.message
+    if not msg.photo:
+        await msg.reply_html(
+            "📸 <b>Send a QR code photo</b> with this caption:\n\n"
+            "<code>/qr_add &lt;name&gt; [priority]</code>\n\n"
+            "Examples:\n"
+            "<code>/qr_add Main QR</code>\n"
+            "<code>/qr_add Backup QR 2</code>\n\n"
+            "<i>Priority is optional (default 1). Higher = more likely in priority mode.</i>"
+        )
+        return
+
+    caption = (msg.caption or "").strip()
+    parts = caption.split(maxsplit=2)
+
+    if len(parts) < 2:
+        await msg.reply_html(
+            "⚠️ Add a name in the caption.\n"
+            "Example: <code>/qr_add Main QR</code>"
+        )
+        return
+
+    # Parse name and optional priority
+    name_parts = parts[1:]
+    priority = 1
+    if name_parts and name_parts[-1].isdigit():
+        priority = int(name_parts[-1])
+        name = " ".join(name_parts[:-1]) or "QR"
+    else:
+        name = " ".join(name_parts)
+
+    file_id = msg.photo[-1].file_id
+
+    with db() as conn:
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) m FROM qr_codes"
+        ).fetchone()["m"]
+        cur = conn.execute("""
+            INSERT INTO qr_codes (name, file_id, priority, position)
+            VALUES (?, ?, ?, ?)
+        """, (name, file_id, priority, max_pos + 1))
+        new_id = cur.lastrowid
+
+    mode = get_qr_mode()
+    await msg.reply_html(
+        f"✅ <b>QR Code Added</b>\n\n"
+        f"ID       : <code>{new_id}</code>\n"
+        f"Name     : {name}\n"
+        f"Priority : {priority}\n"
+        f"Position : {max_pos + 1}\n"
+        f"Mode     : {mode}\n\n"
+        f"<i>Active immediately. Use /qr_list to see all QRs.</i>"
+    )
+
+
+async def cmd_qr_list(update, context):
+    """Admin: /qr_list — show all QR codes with stats."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT id, name, priority, position, is_active, use_count, created_at
+            FROM qr_codes
+            ORDER BY position ASC, id ASC
+        """).fetchall()
+
+    if not rows:
+        await update.message.reply_html(
+            "No QR codes yet.\n\n"
+            "Upload one: send a photo with caption <code>/qr_add Name</code>"
+        )
+        return
+
+    mode = get_qr_mode()
+    rr_idx = get_rr_index()
+    single_id = get_active_single_qr_id()
+
+    active_qrs = [r for r in rows if r["is_active"]]
+    rr_next = active_qrs[rr_idx % len(active_qrs)]["id"] if active_qrs else None
+
+    text = (
+        f"📋 <b>QR Codes</b>\n"
+        f"Mode: <b>{mode}</b>"
+    )
+    if mode == "round_robin" and rr_next:
+        text += f" | Next: ID {rr_next}"
+    if mode == "single" and single_id:
+        text += f" | Active: ID {single_id}"
+    text += f"\n\n"
+
+    for r in rows:
+        status = "✅" if r["is_active"] else "🚫"
+        marker = ""
+        if mode == "single" and r["id"] == single_id:
+            marker = " 👈 ACTIVE"
+        elif mode == "round_robin" and r["id"] == rr_next:
+            marker = " 👈 NEXT"
+        text += (
+            f"{status} <b>ID {r['id']}</b> — {r['name']}{marker}\n"
+            f"   Priority: {r['priority']} | "
+            f"Pos: {r['position']} | "
+            f"Used: {r['use_count']}x\n\n"
+        )
+
+    text += (
+        f"<b>Commands:</b>\n"
+        f"Send photo + <code>/qr_add Name [priority]</code>\n"
+        f"<code>/qr_mode &lt;round_robin|priority|single&gt;</code>\n"
+        f"<code>/qr_priority &lt;id&gt; &lt;value&gt;</code>\n"
+        f"<code>/qr_active &lt;id&gt;</code> — set single active\n"
+        f"<code>/qr_remove &lt;id&gt;</code>\n"
+        f"<code>/qr_restore &lt;id&gt;</code>\n"
+        f"<code>/qr_stats</code>"
+    )
+
+    if len(text) > 4000:
+        text = text[:4000] + "\n<i>(truncated)</i>"
+
+    await update.message.reply_html(text)
+
+
+async def cmd_qr_mode(update, context):
+    """Admin: /qr_mode <round_robin|priority|single|status>
+
+    round_robin → cycle through active QRs in order
+    priority    → weighted random based on priority values (default)
+    single      → always use one specific QR (set with /qr_active <id>)
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/qr_mode &lt;round_robin|priority|single|status&gt;</code>\n\n"
+            "<code>priority</code>    — weighted random (default)\n"
+            "<code>round_robin</code> — cycle in order\n"
+            "<code>single</code>      — one fixed QR (/qr_active to pick which)\n\n"
+            "Example: <code>/qr_mode round_robin</code>"
+        )
+        return
+
+    action = args[0].lower()
+
+    if action == "status":
+        mode = get_qr_mode()
+        single_id = get_active_single_qr_id()
+        rr_idx = get_rr_index()
+        await update.message.reply_html(
+            f"<b>QR Mode:</b> {mode}\n"
+            f"<b>Round-robin index:</b> {rr_idx}\n"
+            f"<b>Single active ID:</b> {single_id or 'not set'}\n\n"
+            f"Use /qr_list to see all QR codes."
+        )
+        return
+
+    valid = ("round_robin", "priority", "single")
+    if action not in valid:
+        await update.message.reply_text(
+            f"Valid modes: {', '.join(valid)}"
+        )
+        return
+
+    set_qr_mode(action)
+
+    extra = ""
+    if action == "single":
+        single_id = get_active_single_qr_id()
+        extra = (
+            f"\n\nUse <code>/qr_active &lt;id&gt;</code> to set which QR to use."
+            if not single_id else
+            f"\n\nCurrently using QR ID <code>{single_id}</code>."
+        )
+
+    await update.message.reply_html(
+        f"✅ <b>QR Mode: {action}</b>{extra}"
+    )
+
+
+async def cmd_qr_priority(update, context):
+    """Admin: /qr_priority <id> <value>
+
+    Set priority weight for a QR code (used in priority mode).
+    Higher value = selected more often.
+
+    Example:
+    /qr_priority 1 5   → QR 1 gets 5x weight
+    /qr_priority 2 1   → QR 2 gets 1x weight
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_html(
+            "Usage: <code>/qr_priority &lt;id&gt; &lt;value&gt;</code>\n\n"
+            "Example: <code>/qr_priority 1 5</code>"
+        )
+        return
+
+    try:
+        qr_id = int(args[0])
+        priority = int(args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ Both ID and value must be numbers.")
+        return
+
+    if priority < 1:
+        await update.message.reply_text("⚠️ Priority must be at least 1.")
+        return
+
+    with db() as conn:
+        r = conn.execute(
+            "SELECT name FROM qr_codes WHERE id=?", (qr_id,)
+        ).fetchone()
+        if not r:
+            await update.message.reply_text(f"⚠️ QR ID {qr_id} not found.")
+            return
+        conn.execute(
+            "UPDATE qr_codes SET priority=? WHERE id=?", (priority, qr_id)
+        )
+
+    await update.message.reply_html(
+        f"✅ <b>Priority Updated</b>\n\n"
+        f"QR ID : <code>{qr_id}</code> — {r['name']}\n"
+        f"Priority : {priority}\n\n"
+        f"<i>Takes effect immediately in priority mode.</i>"
+    )
+
+
+async def cmd_qr_active(update, context):
+    """Admin: /qr_active <id> — set the single active QR code.
+
+    Only used when mode is 'single'.
+    Example: /qr_active 2
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/qr_active &lt;id&gt;</code>\n\n"
+            "Sets which QR is used in single mode.\n"
+            "Example: <code>/qr_active 2</code>"
+        )
+        return
+
+    try:
+        qr_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid ID.")
+        return
+
+    with db() as conn:
+        r = conn.execute(
+            "SELECT name, is_active FROM qr_codes WHERE id=?", (qr_id,)
+        ).fetchone()
+
+    if not r:
+        await update.message.reply_text(f"⚠️ QR ID {qr_id} not found.")
+        return
+    if not r["is_active"]:
+        await update.message.reply_text(
+            f"⚠️ QR ID {qr_id} is deactivated. "
+            f"Use /qr_restore {qr_id} first."
+        )
+        return
+
+    set_active_single_qr_id(qr_id)
+
+    mode = get_qr_mode()
+    extra = ""
+    if mode != "single":
+        extra = (
+            f"\n\n⚠️ Current mode is <b>{mode}</b>. "
+            f"Switch with <code>/qr_mode single</code> to use this QR exclusively."
+        )
+
+    await update.message.reply_html(
+        f"✅ <b>Active QR Set</b>\n\n"
+        f"ID   : <code>{qr_id}</code>\n"
+        f"Name : {r['name']}{extra}"
+    )
+
+
+async def cmd_qr_remove(update, context):
+    """Admin: /qr_remove <id> — deactivate a QR code."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/qr_remove &lt;id&gt;</code>"
+        )
+        return
+
+    try:
+        qr_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid ID.")
+        return
+
+    with db() as conn:
+        r = conn.execute(
+            "SELECT name FROM qr_codes WHERE id=?", (qr_id,)
+        ).fetchone()
+        if not r:
+            await update.message.reply_text(f"⚠️ QR ID {qr_id} not found.")
+            return
+        conn.execute(
+            "UPDATE qr_codes SET is_active=0 WHERE id=?", (qr_id,)
+        )
+
+    await update.message.reply_html(
+        f"🚫 <b>QR Removed</b>\n\n"
+        f"ID   : <code>{qr_id}</code>\n"
+        f"Name : {r['name']}\n\n"
+        f"<i>Use /qr_restore {qr_id} to bring it back.</i>"
+    )
+
+
+async def cmd_qr_restore(update, context):
+    """Admin: /qr_restore <id> — reactivate a removed QR code."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/qr_restore &lt;id&gt;</code>"
+        )
+        return
+
+    try:
+        qr_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid ID.")
+        return
+
+    with db() as conn:
+        r = conn.execute(
+            "SELECT name FROM qr_codes WHERE id=?", (qr_id,)
+        ).fetchone()
+        if not r:
+            await update.message.reply_text(f"⚠️ QR ID {qr_id} not found.")
+            return
+        conn.execute(
+            "UPDATE qr_codes SET is_active=1 WHERE id=?", (qr_id,)
+        )
+
+    await update.message.reply_html(
+        f"✅ <b>QR Restored</b>\n\n"
+        f"ID   : <code>{qr_id}</code>\n"
+        f"Name : {r['name']}\n\n"
+        f"<i>Active immediately.</i>"
+    )
+
+
+async def cmd_qr_stats(update, context):
+    """Admin: /qr_stats — show usage stats for all QR codes."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT id, name, priority, is_active, use_count, position
+            FROM qr_codes
+            ORDER BY use_count DESC
+        """).fetchall()
+        total_uses = conn.execute(
+            "SELECT COALESCE(SUM(use_count), 0) c FROM qr_codes"
+        ).fetchone()["c"]
+
+    if not rows:
+        await update.message.reply_text(
+            "No QR codes yet. Upload one with /qr_add"
+        )
+        return
+
+    mode = get_qr_mode()
+    text = (
+        f"📊 <b>QR Code Stats</b>\n"
+        f"Mode: <b>{mode}</b> | Total uses: <b>{total_uses}</b>\n\n"
+    )
+
+    for r in rows:
+        status = "✅" if r["is_active"] else "🚫"
+        pct = round(r["use_count"] / total_uses * 100) if total_uses else 0
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        text += (
+            f"{status} <b>ID {r['id']}</b> — {r['name']}\n"
+            f"   {bar} {pct}% ({r['use_count']} uses)\n"
+            f"   Priority: {r['priority']} | Pos: {r['position']}\n\n"
+        )
+
+    await update.message.reply_html(text)
+
 
 _HELP_DETAILS = {
     "stats":     ("<b>/stats</b>\n\nOverall bot totals.\n\n"
@@ -4136,11 +4730,33 @@ _HELP_DETAILS = {
                         "<b>Example:</b> <code>/channel_remove 3</code>"),
     "channel_restore": ("<b>/channel_restore &lt;id&gt;</b>\n\nRestore a removed channel.\n\n"
                         "<b>Example:</b> <code>/channel_restore 3</code>"),
+    "qr_list":     ("<b>/qr_list</b>\n\nShow all QR codes with mode, "
+                    "priority, position and usage count.\n\n"
+                    "<b>Example:</b> <code>/qr_list</code>"),
+    "qr_mode":     ("<b>/qr_mode &lt;priority|round_robin|single|status&gt;</b>\n\n"
+                    "Set QR routing method.\n\n"
+                    "<code>priority</code>    — weighted random by priority\n"
+                    "<code>round_robin</code> — cycle in order\n"
+                    "<code>single</code>      — one fixed QR only\n\n"
+                    "<b>Example:</b> <code>/qr_mode round_robin</code>"),
+    "qr_priority": ("<b>/qr_priority &lt;id&gt; &lt;value&gt;</b>\n\n"
+                    "Set weight for priority mode. Higher = more frequent.\n\n"
+                    "<b>Example:</b> <code>/qr_priority 1 5</code>"),
+    "qr_active":   ("<b>/qr_active &lt;id&gt;</b>\n\n"
+                    "Set which QR is used in single mode.\n\n"
+                    "<b>Example:</b> <code>/qr_active 2</code>"),
+    "qr_remove":   ("<b>/qr_remove &lt;id&gt;</b>\n\nDeactivate a QR code.\n\n"
+                    "<b>Example:</b> <code>/qr_remove 3</code>"),
+    "qr_restore":  ("<b>/qr_restore &lt;id&gt;</b>\n\nReactivate a removed QR code.\n\n"
+                    "<b>Example:</b> <code>/qr_restore 3</code>"),
+    "qr_stats":    ("<b>/qr_stats</b>\n\nUsage breakdown per QR with percentage bar.\n\n"
+                    "<b>Example:</b> <code>/qr_stats</code>"),
 }
 
 _HELP_SECTIONS = [
     ("📊 Stats & Reports",      ["stats", "pending", "summary", "listusers", "find", "whoami", "unpaid"]),
     ("📺 Channels",             ["channel_list", "channel_add", "channel_edit", "channel_remove", "channel_restore"]),
+    ("💳 QR Codes",             ["qr_list", "qr_mode", "qr_priority", "qr_active", "qr_remove", "qr_restore", "qr_stats"]),
     ("🧹 Cleanup (single)",     ["wipe", "reset", "resetme"]),
     ("☢️ Cleanup (ALL)",        ["wipeall", "resetall"]),
     ("📢 Communication",        ["broadcast", "msg", "away", "block", "unblock"]),
@@ -6259,6 +6875,13 @@ def main():
     app.add_handler(CommandHandler("channel_remove",  cmd_channel_remove))
     app.add_handler(CommandHandler("channel_restore", cmd_channel_restore))
     app.add_handler(CommandHandler("channel_list",    cmd_channel_list))
+    app.add_handler(CommandHandler("qr_list",     cmd_qr_list))
+    app.add_handler(CommandHandler("qr_mode",     cmd_qr_mode))
+    app.add_handler(CommandHandler("qr_priority", cmd_qr_priority))
+    app.add_handler(CommandHandler("qr_active",   cmd_qr_active))
+    app.add_handler(CommandHandler("qr_remove",   cmd_qr_remove))
+    app.add_handler(CommandHandler("qr_restore",  cmd_qr_restore))
+    app.add_handler(CommandHandler("qr_stats",    cmd_qr_stats))
 
 
     jq = app.job_queue
