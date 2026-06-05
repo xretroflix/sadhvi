@@ -1112,7 +1112,7 @@ async def cmd_sleep(update, context):
             f"Use <code>/sleep_visitors clear</code> to reset the list."
         )
 
-    async def cmd_sleep_visitors(update, context):
+async def cmd_sleep_visitors(update, context):
     """Admin: /sleep_visitors [clear] — list or clear sleep mode visitors.
 
     /sleep_visitors         → show all recorded visitors
