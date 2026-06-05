@@ -69,12 +69,40 @@ def _parse_channel(s: str):
         return None
     return {"name": parts[0], "price": int(parts[1]), "link": parts[2]}
 
-CHANNELS = []
+# Seed channels from env vars only — DB is the source of truth at runtime.
+# Env vars are only used once on first boot to pre-populate the DB.
+_ENV_CHANNELS = []
 for i in range(1, 11):
     c = _parse_channel(os.getenv(f"CHANNEL_{i}", ""))
     if c:
         c["id"] = i
-        CHANNELS.append(c)
+        _ENV_CHANNELS.append(c)
+
+def get_channels() -> list:
+    """Live channel list from DB. Always up to date — no restart needed."""
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT id, name, price, link, position
+            FROM channels
+            WHERE is_active=1
+            ORDER BY position ASC, id ASC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+# Module-level alias so all existing code using CHANNELS still works.
+# Every access re-queries DB so changes are instant.
+class _ChannelProxy:
+    """Proxy that makes CHANNELS behave like a list but always reads from DB."""
+    def __iter__(self):
+        return iter(get_channels())
+    def __len__(self):
+        return len(get_channels())
+    def __getitem__(self, idx):
+        return get_channels()[idx]
+    def __bool__(self):
+        return bool(get_channels())
+
+CHANNELS = _ChannelProxy()
 
 # BUNDLE CHANNELS — Each bundle has its own invite link
 # Format: "Bundle Name|Price|Invite Link"
@@ -194,6 +222,25 @@ def init_db():
                 expires_at          TEXT
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_promo ON active_promotions(channel_id, segment) WHERE is_active=1;
+            CREATE TABLE IF NOT EXISTS sleep_visitors (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                first_name  TEXT,
+                last_name   TEXT,
+                username    TEXT,
+                visited_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_sleep_vis
+                ON sleep_visitors(visited_at);
+            CREATE TABLE IF NOT EXISTS channels (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                price       INTEGER NOT NULL,
+                link        TEXT NOT NULL,
+                is_active   INTEGER DEFAULT 1,
+                position    INTEGER DEFAULT 0,
+                created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         # Migration safety: add columns if upgrading from v2/v3
         try:
@@ -212,6 +259,25 @@ def init_db():
             conn.execute("ALTER TABLE channel_visibility ADD COLUMN custom_price INTEGER")
         except sqlite3.OperationalError:
             pass
+
+    seed_channels_from_env()
+
+def seed_channels_from_env():
+    """On first boot, copy env var channels into DB if DB is empty.
+    After that, DB is the sole source of truth."""
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT COUNT(*) c FROM channels"
+        ).fetchone()["c"]
+        if existing > 0:
+            return  # DB already has channels — don't overwrite
+        for i, c in enumerate(_ENV_CHANNELS):
+            conn.execute("""
+                INSERT INTO channels (name, price, link, position)
+                VALUES (?, ?, ?, ?)
+            """, (c["name"], c["price"], c["link"], i))
+        if _ENV_CHANNELS:
+            log.info(f"Seeded {len(_ENV_CHANNELS)} channels from env vars into DB")
 
 def upsert_user(u):
     with db() as conn:
@@ -913,6 +979,491 @@ async def full_reset(context, user_id: int):
     # Wipe all DB state
     reset_user_data(user_id)
 
+async def cmd_proof_mode(update, context):
+    """Admin: /proof_mode <upi|screenshot|both|none>
+
+    upi        → only UPI name collection
+    screenshot → only screenshot collection
+    both       → both options shown (default)
+    none       → skip proof entirely, queues for manual admin approval
+
+    Examples:
+    /proof_mode upi
+    /proof_mode screenshot
+    /proof_mode both
+    /proof_mode none
+    /proof_mode status
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/proof_mode &lt;upi|screenshot|both|none|status&gt;</code>\n\n"
+            "<code>both</code>       — UPI name + Screenshot (default)\n"
+            "<code>upi</code>        — UPI name only\n"
+            "<code>screenshot</code> — Screenshot only\n"
+            "<code>none</code>       — Skip proof, queue for manual approval\n\n"
+            "Example: <code>/proof_mode upi</code>"
+        )
+        return
+
+    action = args[0].lower()
+
+    if action == "status":
+        mode = get_proof_mode()
+        labels = {
+            "both":       "👤 UPI Name + 📸 Screenshot",
+            "upi":        "👤 UPI Name only",
+            "screenshot": "📸 Screenshot only",
+            "none":       "⏭️ No proof — manual approval queue",
+        }
+        await update.message.reply_html(
+            f"<b>Proof Mode:</b> {labels.get(mode, mode)}\n\n"
+            f"<i>Change with /proof_mode &lt;upi|screenshot|both|none&gt;</i>"
+        )
+        return
+
+    if action not in ("upi", "screenshot", "both", "none"):
+        await update.message.reply_text(
+            "Valid options: upi, screenshot, both, none, status"
+        )
+        return
+
+    set_admin_setting("proof_mode", action)
+
+    labels = {
+        "both":       "👤 UPI Name + 📸 Screenshot",
+        "upi":        "👤 UPI Name only",
+        "screenshot": "📸 Screenshot only",
+        "none":       "⏭️ No proof — manual approval queue",
+    }
+    await update.message.reply_html(
+        f"✅ <b>Proof Mode set:</b> {labels[action]}\n\n"
+        f"<i>Takes effect immediately on next payment.</i>"
+    )
+
+async def cmd_sleep(update, context):
+    """Admin: /sleep <on|off|status>
+
+    on  → Bot goes silent. Records all /start visitors, sends no reply.
+    off → Bot wakes up and responds normally.
+
+    Examples:
+    /sleep on
+    /sleep off
+    /sleep status
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/sleep &lt;on|off|status&gt;</code>\n\n"
+            "<code>/sleep on</code>     — Bot goes silent, records visitors\n"
+            "<code>/sleep off</code>    — Bot wakes up\n"
+            "<code>/sleep status</code> — Current state + visitor count\n\n"
+            "Use <code>/sleep_visitors</code> to see who visited while asleep."
+        )
+        return
+
+    action = args[0].lower()
+
+    if action == "status":
+        enabled = is_sleep_mode()
+        with db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) c FROM sleep_visitors"
+            ).fetchone()["c"]
+        status = "😴 SLEEPING" if enabled else "✅ AWAKE"
+        await update.message.reply_html(
+            f"<b>Bot Status:</b> {status}\n"
+            f"<b>Visitors recorded:</b> {count}\n\n"
+            f"<i>Use /sleep_visitors to see the full list.</i>"
+        )
+        return
+
+    if action not in ("on", "off"):
+        await update.message.reply_text("Use: on, off, or status")
+        return
+
+    enabled = action == "on"
+    set_admin_setting("sleep_mode", "true" if enabled else "false")
+
+    if enabled:
+        await update.message.reply_html(
+            "😴 <b>Sleep mode ON</b>\n\n"
+            "Bot is now silent. All /start visitors are recorded.\n"
+            "Use <code>/sleep_visitors</code> to see who visited.\n"
+            "Use <code>/sleep off</code> to wake up."
+        )
+    else:
+        # Show visitor count collected during sleep
+        with db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) c FROM sleep_visitors"
+            ).fetchone()["c"]
+        await update.message.reply_html(
+            f"✅ <b>Bot is now AWAKE</b>\n\n"
+            f"Recorded <b>{count}</b> visitors while asleep.\n"
+            f"Use <code>/sleep_visitors</code> to see them.\n"
+            f"Use <code>/sleep_visitors clear</code> to reset the list."
+        )
+
+    async def cmd_sleep_visitors(update, context):
+    """Admin: /sleep_visitors [clear] — list or clear sleep mode visitors.
+
+    /sleep_visitors         → show all recorded visitors
+    /sleep_visitors clear   → wipe the visitor list
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+
+    if args and args[0].lower() == "clear":
+        with db() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) c FROM sleep_visitors"
+            ).fetchone()["c"]
+            conn.execute("DELETE FROM sleep_visitors")
+        await update.message.reply_html(
+            f"🗑 Cleared <b>{count}</b> sleep visitors."
+        )
+        return
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT user_id, first_name, last_name, username, visited_at
+            FROM sleep_visitors
+            ORDER BY visited_at DESC
+            LIMIT 100
+        """).fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "No visitors recorded yet.\n"
+            "Enable sleep mode with /sleep on"
+        )
+        return
+
+    text = f"😴 <b>Sleep Visitors ({len(rows)})</b>\n\n"
+    for r in rows:
+        nm = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or "—"
+        un = f"@{r['username']}" if r['username'] else "(no username)"
+        ts = r['visited_at'][:16].replace("T", " ")
+        text += (
+            f"<code>{r['user_id']}</code> — {nm} {un}\n"
+            f"  <i>{ts}</i>\n"
+        )
+
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n<i>(truncated — use /sleep_visitors clear to reset)</i>"
+
+    # Also send as CSV for bulk targeting
+    csv_buf = io.StringIO()
+    csv_writer = csv.writer(csv_buf)
+    csv_writer.writerow(["UserID", "Name", "Username", "VisitedAt"])
+    for r in rows:
+        nm = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip()
+        csv_writer.writerow([
+            r['user_id'], nm,
+            r['username'] or "", r['visited_at']
+        ])
+
+    await update.message.reply_html(
+        text, disable_web_page_preview=True
+    )
+    try:
+        await context.bot.send_document(
+            chat_id=ADMIN_ID,
+            document=InputFile(
+                BytesIO(csv_buf.getvalue().encode()),
+                filename="sleep_visitors.csv"
+            ),
+            caption="Sleep mode visitor list — ready for /bulk_promo_users",
+        )
+    except Exception as e:
+        log.debug(f"sleep visitors CSV send failed: {e}")
+
+async def cmd_channel_add(update, context):
+    """Admin: /channel_add <name> | <price> | <invite_link>
+
+    Add a new channel. Takes effect immediately — no restart needed.
+
+    Example:
+    /channel_add Premium Pack | 199 | https://t.me/+HASH
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args_raw = update.message.text.split(maxsplit=1)
+    if len(args_raw) < 2 or "|" not in args_raw[1]:
+        await update.message.reply_html(
+            "Usage: <code>/channel_add &lt;name&gt; | &lt;price&gt; | &lt;invite_link&gt;</code>\n\n"
+            "Example:\n"
+            "<code>/channel_add Premium Pack | 199 | https://t.me/+HASH</code>"
+        )
+        return
+
+    parts = [p.strip() for p in args_raw[1].split("|")]
+    if len(parts) != 3:
+        await update.message.reply_html(
+            "⚠️ Need exactly 3 parts separated by <code>|</code>\n"
+            "Format: <code>Name | Price | Link</code>"
+        )
+        return
+
+    name, price_str, link = parts
+    try:
+        price = int(price_str)
+    except ValueError:
+        await update.message.reply_text("⚠️ Price must be a number.")
+        return
+
+    if price < 1:
+        await update.message.reply_text("⚠️ Price must be positive.")
+        return
+
+    if not link.startswith("https://t.me/"):
+        await update.message.reply_text(
+            "⚠️ Link must start with https://t.me/"
+        )
+        return
+
+    # Get next position
+    with db() as conn:
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), 0) m FROM channels"
+        ).fetchone()["m"]
+        cur = conn.execute("""
+            INSERT INTO channels (name, price, link, position)
+            VALUES (?, ?, ?, ?)
+        """, (name, price, link, max_pos + 1))
+        new_id = cur.lastrowid
+
+    await update.message.reply_html(
+        f"✅ <b>Channel Added</b>\n\n"
+        f"ID       : <code>{new_id}</code>\n"
+        f"Name     : {name}\n"
+        f"Price    : ₹{price}\n"
+        f"Link     : <code>{link}</code>\n"
+        f"Position : {max_pos + 1}\n\n"
+        f"<i>Live immediately — no restart needed.</i>"
+    )
+
+
+async def cmd_channel_edit(update, context):
+    """Admin: /channel_edit <id> <field> <value>
+
+    Edit a channel's name, price, or link.
+
+    Fields: name, price, link
+
+    Examples:
+    /channel_edit 1 price 299
+    /channel_edit 1 name VIP Pack
+    /channel_edit 1 link https://t.me/+NEWHASH
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if len(args) < 3:
+        await update.message.reply_html(
+            "Usage: <code>/channel_edit &lt;id&gt; &lt;field&gt; &lt;value&gt;</code>\n\n"
+            "Fields: <code>name</code>, <code>price</code>, <code>link</code>, "
+            "<code>position</code>\n\n"
+            "Examples:\n"
+            "<code>/channel_edit 1 price 299</code>\n"
+            "<code>/channel_edit 1 name VIP Pack</code>\n"
+            "<code>/channel_edit 1 link https://t.me/+NEWHASH</code>\n"
+            "<code>/channel_edit 1 position 2</code>"
+        )
+        return
+
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid channel ID.")
+        return
+
+    field = args[1].lower()
+    value_raw = " ".join(args[2:])
+
+    allowed = ("name", "price", "link", "position")
+    if field not in allowed:
+        await update.message.reply_text(
+            f"⚠️ Field must be one of: {', '.join(allowed)}"
+        )
+        return
+
+    # Type-check value
+    if field in ("price", "position"):
+        try:
+            value = int(value_raw)
+        except ValueError:
+            await update.message.reply_text(f"⚠️ {field} must be a number.")
+            return
+    else:
+        value = value_raw
+
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM channels WHERE id=?", (channel_id,)
+        ).fetchone()
+        if not existing:
+            await update.message.reply_text(
+                f"⚠️ Channel ID {channel_id} not found."
+            )
+            return
+        conn.execute(
+            f"UPDATE channels SET {field}=? WHERE id=?",
+            (value, channel_id)
+        )
+
+    await update.message.reply_html(
+        f"✅ <b>Channel Updated</b>\n\n"
+        f"ID    : <code>{channel_id}</code>\n"
+        f"Field : {field}\n"
+        f"Value : {value}\n\n"
+        f"<i>Live immediately — no restart needed.</i>"
+    )
+
+
+async def cmd_channel_remove(update, context):
+    """Admin: /channel_remove <id>
+
+    Deactivate a channel (soft delete — data kept, just hidden from users).
+    Use /channel_restore <id> to bring it back.
+
+    Example:
+    /channel_remove 3
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/channel_remove &lt;id&gt;</code>\n\n"
+            "Soft-deletes the channel (hidden from users, data kept).\n"
+            "Example: <code>/channel_remove 3</code>"
+        )
+        return
+
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid channel ID.")
+        return
+
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM channels WHERE id=?", (channel_id,)
+        ).fetchone()
+        if not existing:
+            await update.message.reply_text(
+                f"⚠️ Channel ID {channel_id} not found."
+            )
+            return
+        conn.execute(
+            "UPDATE channels SET is_active=0 WHERE id=?", (channel_id,)
+        )
+
+    await update.message.reply_html(
+        f"🚫 <b>Channel Removed</b>\n\n"
+        f"ID   : <code>{channel_id}</code>\n"
+        f"Name : {existing['name']}\n\n"
+        f"<i>Hidden from users immediately. "
+        f"Use /channel_restore {channel_id} to bring it back.</i>"
+    )
+
+
+async def cmd_channel_restore(update, context):
+    """Admin: /channel_restore <id> — restore a removed channel."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/channel_restore &lt;id&gt;</code>"
+        )
+        return
+
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid channel ID.")
+        return
+
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT * FROM channels WHERE id=?", (channel_id,)
+        ).fetchone()
+        if not existing:
+            await update.message.reply_text(
+                f"⚠️ Channel ID {channel_id} not found."
+            )
+            return
+        conn.execute(
+            "UPDATE channels SET is_active=1 WHERE id=?", (channel_id,)
+        )
+
+    await update.message.reply_html(
+        f"✅ <b>Channel Restored</b>\n\n"
+        f"ID   : <code>{channel_id}</code>\n"
+        f"Name : {existing['name']}\n\n"
+        f"<i>Visible to users immediately.</i>"
+    )
+
+
+async def cmd_channel_list(update, context):
+    """Admin: /channel_list — show all channels (active and inactive)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT id, name, price, link, is_active, position
+            FROM channels
+            ORDER BY position ASC, id ASC
+        """).fetchall()
+
+    if not rows:
+        await update.message.reply_html(
+            "No channels in DB yet.\n\n"
+            "Add one: <code>/channel_add Name | Price | Link</code>"
+        )
+        return
+
+    text = f"📺 <b>All Channels ({len(rows)})</b>\n\n"
+    for r in rows:
+        status = "✅" if r["is_active"] else "🚫"
+        text += (
+            f"{status} <b>ID {r['id']}</b> — {r['name']}\n"
+            f"   💰 ₹{r['price']} | 📌 pos {r['position']}\n"
+            f"   🔗 <code>{r['link']}</code>\n\n"
+        )
+
+    text += (
+        f"<b>Commands:</b>\n"
+        f"<code>/channel_add Name | Price | Link</code>\n"
+        f"<code>/channel_edit &lt;id&gt; &lt;field&gt; &lt;value&gt;</code>\n"
+        f"<code>/channel_remove &lt;id&gt;</code>\n"
+        f"<code>/channel_restore &lt;id&gt;</code>"
+    )
+
+    if len(text) > 4000:
+        text = text[:4000] + "\n<i>(truncated)</i>"
+
+    await update.message.reply_html(
+        text, disable_web_page_preview=True
+    )
+
 # ==================================================================
 # HELPERS
 # ==================================================================
@@ -958,6 +1509,31 @@ def admin_action_kb(pid):
         ],
         [InlineKeyboardButton("📸 Request Screenshot", callback_data=f"adm:reqss:{pid}")],
     ])
+
+def get_proof_mode() -> str:
+    """Return current proof mode: 'both', 'upi', 'screenshot', 'none'."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM admin_settings WHERE key='proof_mode'"
+        ).fetchone()
+    return r["value"] if r else "both"
+
+def is_sleep_mode() -> bool:
+    """Check if bot is in sleep mode."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM admin_settings WHERE key='sleep_mode'"
+        ).fetchone()
+    return r["value"].lower() == "true" if r else False
+
+def log_sleep_visitor(user):
+    """Record a user who visited during sleep mode."""
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO sleep_visitors
+                (user_id, first_name, last_name, username)
+            VALUES (?, ?, ?, ?)
+        """, (user.id, user.first_name, user.last_name, user.username))
 
 # ==================================================================
 # USER: /start
@@ -1067,11 +1643,18 @@ def build_single_tier_keyboard():
 
 async def cmd_start(update, context):
     user = update.effective_user
-    
-    # Check if user is blocked — if so, ignore silently (don't respond)
+
+    # Check if user is blocked — ignore silently
     if is_blocked(user.id):
         return
-    
+
+    # Sleep mode — record visitor silently, send no response
+    if is_sleep_mode() and user.id != ADMIN_ID:
+        upsert_user(user)
+        log_sleep_visitor(user)
+        log.info(f"Sleep mode: recorded visitor {user.id}")
+        return
+
     upsert_user(user)
     reset_inactivity_timer(context, user.id)
 
@@ -1621,12 +2204,85 @@ async def cb_upi_start(update, context):
     except Exception as e:
         log.debug(f"QR delete failed: {e}")
 
-    # Send a clean text message offering verification choice
+    proof_mode = get_proof_mode()
+
+    # proof_mode == "none" — skip proof entirely, notify admin to manually approve
+    if proof_mode == "none":
+        update_purchase(pid, status="verifying",
+                        upi_submitted_at=datetime.utcnow().isoformat())
+
+        m = await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "✅ <b>PAYMENT RECORDED</b>\n\n"
+                "<i>Admin will verify and approve shortly.\n"
+                "Please wait here.</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+            protect_content=True,
+            disable_notification=True,
+        )
+        update_purchase(pid, main_msg_id=m.message_id)
+        track_msg(user.id, m.message_id)
+
+        # Notify admin with approve/reject buttons
+        u_row = get_user_row(user.id)
+        p_row = get_purchase(pid)
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"💸 <b>Payment Claimed (No Proof)</b>\n\n"
+                    f"{fmt_user_block(u_row, p_row)}\n\n"
+                    f"⚠️ Proof collection is OFF — verify manually."
+                ),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=admin_action_kb(pid),
+            )
+        except Exception as e:
+            log.error(f"Admin no-proof notify failed: {e}")
+        return
+
+    # proof_mode == "upi" — UPI name only, skip choice screen
+    if proof_mode == "upi":
+        AWAITING_UPI[user.id] = pid
+        m = await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "✍️ <b>UPI NAME?</b>\n\n"
+                "Type the name on your UPI account.\n\n"
+                "Example: <b>Sakshi</b>"
+            ),
+            parse_mode=ParseMode.HTML,
+            protect_content=True,
+            disable_notification=True,
+        )
+        update_purchase(pid, main_msg_id=m.message_id)
+        track_msg(user.id, m.message_id)
+        return
+
+    # proof_mode == "screenshot" — screenshot only, skip choice screen
+    if proof_mode == "screenshot":
+        update_purchase(pid, status="screenshot_requested")
+        m = await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "📸 <b>SEND SCREENSHOT</b>\n\n"
+                "Send your payment success screenshot here."
+            ),
+            parse_mode=ParseMode.HTML,
+            protect_content=True,
+            disable_notification=True,
+        )
+        update_purchase(pid, main_msg_id=m.message_id)
+        track_msg(user.id, m.message_id)
+        return
+
+    # proof_mode == "both" — show choice screen (original behaviour)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Send UPI Name",
                               callback_data=f"proof:name:{pid}")],
-        [InlineKeyboardButton("📸 Send Screenshot",
-                          callback_data=f"proof:shot:{pid}")],
     ])
     m = await context.bot.send_message(
         chat_id=user.id,
@@ -1770,7 +2426,7 @@ async def on_text_message(update, context):
             try:
                 await context.bot.send_message(
                     user.id,
-                    "🚫 Your account has been blocked due to repeated invalid submissions.",
+                    "🚫 No Service! Come back after 24 hours.",
                     disable_notification=True,
                 )
             except Exception:
@@ -3456,19 +4112,54 @@ _HELP_DETAILS = {
                   "<b>Examples:</b>\n"
                   "<code>/tier_gate off</code>\n"
                   "<code>/tier_gate on</code>"),
+    "proof_mode": ("<b>/proof_mode &lt;upi|screenshot|both|none|status&gt;</b>\n\n"
+                   "Control what proof users must submit after paying.\n\n"
+                   "<code>both</code>       — UPI name + Screenshot (default)\n"
+                   "<code>upi</code>        — UPI name only\n"
+                   "<code>screenshot</code> — Screenshot only\n"
+                   "<code>none</code>       — No proof, manual approval queue\n\n"
+                   "<b>Example:</b> <code>/proof_mode upi</code>"),
+    "sleep":      ("<b>/sleep &lt;on|off|status&gt;</b>\n\n"
+                   "Put bot in silent mode. Records all /start visitors "
+                   "without replying. Use /sleep_visitors to see who came.\n\n"
+                   "<b>Example:</b> <code>/sleep on</code>"),
+    "sleep_visitors": ("<b>/sleep_visitors [clear]</b>\n\n"
+                   "List all users who clicked /start during sleep mode. "
+                   "Also sends a CSV ready for /bulk_promo_users.\n\n"
+                   "<code>/sleep_visitors</code> — show list\n"
+                   "<code>/sleep_visitors clear</code> — wipe list\n\n"
+                   "<b>Example:</b> <code>/sleep_visitors</code>"),
+    "channel_list":    ("<b>/channel_list</b>\n\nShow all channels with ID, price, "
+                        "link, and status.\n\n"
+                        "<b>Example:</b> <code>/channel_list</code>"),
+    "channel_add":     ("<b>/channel_add &lt;name&gt; | &lt;price&gt; | &lt;link&gt;</b>\n\n"
+                        "Add a new channel. Live immediately.\n\n"
+                        "<b>Example:</b>\n"
+                        "<code>/channel_add VIP Pack | 299 | https://t.me/+HASH</code>"),
+    "channel_edit":    ("<b>/channel_edit &lt;id&gt; &lt;field&gt; &lt;value&gt;</b>\n\n"
+                        "Edit name, price, link, or position of a channel.\n\n"
+                        "<b>Examples:</b>\n"
+                        "<code>/channel_edit 1 price 399</code>\n"
+                        "<code>/channel_edit 1 name Gold Pack</code>"),
+    "channel_remove":  ("<b>/channel_remove &lt;id&gt;</b>\n\nSoft-delete a channel "
+                        "(hidden from users, data kept).\n\n"
+                        "<b>Example:</b> <code>/channel_remove 3</code>"),
+    "channel_restore": ("<b>/channel_restore &lt;id&gt;</b>\n\nRestore a removed channel.\n\n"
+                        "<b>Example:</b> <code>/channel_restore 3</code>"),
 }
 
 _HELP_SECTIONS = [
     ("📊 Stats & Reports",      ["stats", "pending", "summary", "listusers", "find", "whoami", "unpaid"]),
+    ("📺 Channels",             ["channel_list", "channel_add", "channel_edit", "channel_remove", "channel_restore"]),
     ("🧹 Cleanup (single)",     ["wipe", "reset", "resetme"]),
     ("☢️ Cleanup (ALL)",        ["wipeall", "resetall"]),
     ("📢 Communication",        ["broadcast", "msg", "away", "block", "unblock"]),
     ("🎯 Targeting & Offers",   ["offer_tier", "offer_user", "offer_users", "retarget", "bulk_ids", "bulk_promo_users"]),
     ("🎉 Promotions",           ["promo_set", "promo_clear", "promo_status", "promo_send", "promo_personal"]),
-    ("⚙️ Settings",             ["fallback_toggle", "special_offers_toggle", "tier_gate"]),
+    ("⚙️ Settings",             ["fallback_toggle", "special_offers_toggle", "tier_gate", "proof_mode", "sleep", "sleep_visitors"]),
     ("💾 DB Backup",            ["backup", "restore", "import_csv"]),
     ("📋 Diagnostics",          ["logs"]),
-    ("✅ Manual Approval",  ["approve", "reject"]),
+    ("✅ Manual Approval",      ["approve", "reject"]),
 ]
 
 
@@ -5568,6 +6259,14 @@ def main():
         & filters.User(ADMIN_ID),
         on_admin_media,
     ))
+    app.add_handler(CommandHandler("proof_mode",      cmd_proof_mode))
+    app.add_handler(CommandHandler("sleep",           cmd_sleep))
+    app.add_handler(CommandHandler("sleep_visitors",  cmd_sleep_visitors))
+    app.add_handler(CommandHandler("channel_add",     cmd_channel_add))
+    app.add_handler(CommandHandler("channel_edit",    cmd_channel_edit))
+    app.add_handler(CommandHandler("channel_remove",  cmd_channel_remove))
+    app.add_handler(CommandHandler("channel_restore", cmd_channel_restore))
+    app.add_handler(CommandHandler("channel_list",    cmd_channel_list))
 
 
     jq = app.job_queue
