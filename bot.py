@@ -80,14 +80,18 @@ for i in range(1, 11):
 
 def get_channels() -> list:
     """Live channel list from DB. Always up to date — no restart needed."""
-    with db() as conn:
-        rows = conn.execute("""
-            SELECT id, name, price, link, position
-            FROM channels
-            WHERE is_active=1
-            ORDER BY position ASC, id ASC
-        """).fetchall()
-    return [dict(r) for r in rows]
+    try:
+        with db() as conn:
+            rows = conn.execute("""
+                SELECT id, name, price, link, position
+                FROM channels
+                WHERE is_active=1
+                ORDER BY position ASC, id ASC
+            """).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet — init_db hasn't run. Return empty safely.
+        return []
 
 # Module-level alias so all existing code using CHANNELS still works.
 # Every access re-queries DB so changes are instant.
@@ -1045,16 +1049,7 @@ async def cmd_proof_mode(update, context):
     )
 
 async def cmd_sleep(update, context):
-    """Admin: /sleep <on|off|status>
-
-    on  → Bot goes silent. Records all /start visitors, sends no reply.
-    off → Bot wakes up and responds normally.
-
-    Examples:
-    /sleep on
-    /sleep off
-    /sleep status
-    """
+    """Admin: /sleep <on|off|status>"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1100,7 +1095,6 @@ async def cmd_sleep(update, context):
             "Use <code>/sleep off</code> to wake up."
         )
     else:
-        # Show visitor count collected during sleep
         with db() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) c FROM sleep_visitors"
@@ -1112,12 +1106,9 @@ async def cmd_sleep(update, context):
             f"Use <code>/sleep_visitors clear</code> to reset the list."
         )
 
-async def cmd_sleep_visitors(update, context):
-    """Admin: /sleep_visitors [clear] — list or clear sleep mode visitors.
 
-    /sleep_visitors         → show all recorded visitors
-    /sleep_visitors clear   → wipe the visitor list
-    """
+async def cmd_sleep_visitors(update, context):
+    """Admin: /sleep_visitors [clear] — list or clear sleep mode visitors."""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1162,7 +1153,6 @@ async def cmd_sleep_visitors(update, context):
     if len(text) > 4000:
         text = text[:4000] + "\n\n<i>(truncated — use /sleep_visitors clear to reset)</i>"
 
-    # Also send as CSV for bulk targeting
     csv_buf = io.StringIO()
     csv_writer = csv.writer(csv_buf)
     csv_writer.writerow(["UserID", "Name", "Username", "VisitedAt"])
@@ -6173,20 +6163,22 @@ async def on_error(update, context):
 def main():
     if not BOT_TOKEN or not ADMIN_ID:
         raise RuntimeError("Set BOT_TOKEN and ADMIN_ID env vars.")
-    if not CHANNELS:
-        log.warning("No CHANNEL_n env vars set!")
-    
+
     # Check database path
     db_size = 0
     if os.path.exists(DB_PATH):
-        db_size = os.path.getsize(DB_PATH) / (1024 * 1024)  # Convert to MB
+        db_size = os.path.getsize(DB_PATH) / (1024 * 1024)
         log.info(f"✅ Using local database: {DB_PATH} ({db_size:.2f} MB)")
     else:
         log.info(f"📝 Database will be created at: {DB_PATH}")
-    
+
     log.info(f"✅ Database is committed to git - all data persists across deploys!")
 
+    # init_db FIRST — must run before anything queries CHANNELS
     init_db()
+
+    if not CHANNELS:
+        log.warning("No channels configured. Add one with /channel_add")
     app = Application.builder().token(BOT_TOKEN).build()
 
     # User
