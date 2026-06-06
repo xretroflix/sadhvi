@@ -1949,59 +1949,7 @@ async def cmd_start(update, context):
                 "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
                 (user.id,))
 
-        # 5. Show welcome-back message for returning users on empty chat.
-        #    Paid users  → warm return message.
-        #    Unpaid users who visited before → gentle nudge to continue.
-        #    Brand new users (just registered by upsert_user above) → silent.
-        if not existing_id:
-            # Check if this user existed BEFORE this /start call.
-            # upsert_user does INSERT OR IGNORE so created_at is only set
-            # on the very first visit. If created_at is older than 10 seconds
-            # the user is a returning visitor, not brand new.
-            with db() as conn:
-                u_ts = conn.execute(
-                    "SELECT created_at FROM users WHERE user_id=?",
-                    (user.id,)
-                ).fetchone()
-
-            is_returning = False
-            if u_ts and u_ts["created_at"]:
-                try:
-                    created = datetime.fromisoformat(u_ts["created_at"])
-                    age_seconds = (datetime.utcnow() - created).total_seconds()
-                    is_returning = age_seconds > 10
-                except Exception:
-                    is_returning = False
-
-            if is_returning:
-                if paid_t1:
-                    welcome_text = (
-                        "✨ <b>You're back!</b> Tap /start to continue ✨"
-                    )
-                else:
-                    welcome_text = (
-                        "👋 <b>Welcome back!</b>\n\n"
-                        "You haven't completed your purchase yet.\n"
-                        "Tap below to pick up where you left off 👇"
-                    )
-
-                try:
-                    wb = await context.bot.send_message(
-                        chat_id=user.id,
-                        text=welcome_text,
-                        parse_mode=ParseMode.HTML,
-                        disable_notification=True,
-                    )
-                    track_msg(user.id, wb.message_id)
-                    # Auto-delete after 4s — feels like a flash greeting
-                    # before the menu appears right below it
-                    schedule_auto_delete(
-                        context, user.id, wb.message_id, delay_seconds=4
-                    )
-                except Exception as e:
-                    log.debug(f"welcome-back message failed: {e}")
-
-        # 6. Send fresh /start menu
+        # 5. Send fresh /start menu
         m = await context.bot.send_message(
             chat_id=user.id, text=intro, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(rows),
