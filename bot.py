@@ -51,12 +51,12 @@ QR_DELAY_SECONDS = int(os.getenv("QR_DELAY_SECONDS", "2"))
 
 # Auto-delete unused QR after this many MINUTES (0 = never expire)
 # If user gets the QR but doesn't tap "I've Paid" in time, QR is removed.
-QR_EXPIRY_MINUTES = int(os.getenv("QR_EXPIRY_MINUTES", "15"))
+QR_EXPIRY_MINUTES = int(os.getenv("QR_EXPIRY_MINUTES", "5"))
 
 # Auto-wipe user chat this many MINUTES after approval/rejection (0 = disabled)
 # Default 30 mins — gives user time to join channel, then cleans up the chat.
 # When user comes back later, chat looks fresh.
-AUTO_WIPE_MINUTES = int(os.getenv("AUTO_WIPE_MINUTES", "30"))
+AUTO_WIPE_MINUTES = int(os.getenv("AUTO_WIPE_MINUTES", "5"))
 
 # Auto-wipe idle user chat after this many MINUTES of no interaction (0 = disabled)
 INACTIVITY_MINUTES = int(os.getenv("INACTIVITY_MINUTES", "5"))
