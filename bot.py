@@ -2417,8 +2417,7 @@ async def cb_upi_start(update, context):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤  UPI Name ",
                               callback_data=f"proof:name:{pid}")],
-        [InlineKeyboardButton(" OR ",
-                              callback_data=f"proof:noop:{pid}")],
+        [InlineKeyboardButton(" OR "]
         [InlineKeyboardButton("📸  Screenshot ",
                               callback_data=f"proof:shot:{pid}")],
     ])
