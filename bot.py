@@ -2413,14 +2413,16 @@ async def cb_upi_start(update, context):
         track_msg(user.id, m.message_id)
         return
 
-    # proof_mode == "both" — show choice screen (original behaviour)
+    # proof_mode == "both" — show both options
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Send UPI Name",
                               callback_data=f"proof:name:{pid}")],
+        [InlineKeyboardButton("📸 Send Screenshot",
+                              callback_data=f"proof:shot:{pid}")],
     ])
     m = await context.bot.send_message(
         chat_id=user.id,
-        text="✅ <b>HOW TO VERIFY?</b>",
+        text="✅ <b>HOW TO VERIFY?</b>\n\nChoose your verification method:",
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
         protect_content=True,
