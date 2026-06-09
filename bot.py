@@ -2413,12 +2413,13 @@ async def cb_upi_start(update, context):
         track_msg(user.id, m.message_id)
         return
 
-    # proof_mode == "both" — show both options with OR separator
+    # proof_mode == "both" — show both options
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤  UPI Name ",
+        [InlineKeyboardButton("👤 Send UPI Name",
                               callback_data=f"proof:name:{pid}")],
-        [InlineKeyboardButton(" OR "]
-        [InlineKeyboardButton("📸  Screenshot ",
+        [InlineKeyboardButton("- OR -",
+                              callback_data=f"proof:noop:{pid}")],
+        [InlineKeyboardButton("📸 Send Screenshot",
                               callback_data=f"proof:shot:{pid}")],
     ])
     m = await context.bot.send_message(
@@ -2429,6 +2430,8 @@ async def cb_upi_start(update, context):
         protect_content=True,
         disable_notification=True,
     )
+    update_purchase(pid, main_msg_id=m.message_id)
+    track_msg(user.id, m.message_id)
 
 
 async def cb_proof_choice(update, context):
@@ -6774,6 +6777,12 @@ async def check_pending_reminders(context):
 # ==================================================================
 # MAIN
 # ==================================================================
+
+async def cb_proof_noop(update, context):
+    """No-op callback for the OR separator button — just answer silently."""
+    q = update.callback_query
+    await q.answer("👆 Choose one of the options above", show_alert=False)
+
 async def on_error(update, context):
     log.error("Handler exception:", exc_info=context.error)
 
@@ -6883,6 +6892,7 @@ def main():
     app.add_handler(CommandHandler("qr_remove",   cmd_qr_remove))
     app.add_handler(CommandHandler("qr_restore",  cmd_qr_restore))
     app.add_handler(CommandHandler("qr_stats",    cmd_qr_stats))
+    app.add_handler(CallbackQueryHandler(cb_proof_noop, pattern=r"^proof:noop:"))
 
 
     jq = app.job_queue
