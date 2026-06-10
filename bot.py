@@ -298,21 +298,37 @@ def init_db():
     seed_channels_from_env()
 
 def seed_channels_from_env():
-    """On first boot, copy env var channels into DB if DB is empty.
-    After that, DB is the sole source of truth."""
+    """Seed env var channels into DB if no active channels exist.
+    Safe to call multiple times — only inserts if DB has no active channels."""
+    if not _ENV_CHANNELS:
+        log.warning("No CHANNEL_n env vars set and no channels in DB.")
+        return
+
     with db() as conn:
         existing = conn.execute(
-            "SELECT COUNT(*) c FROM channels"
+            "SELECT COUNT(*) c FROM channels WHERE is_active=1"
         ).fetchone()["c"]
         if existing > 0:
-            return  # DB already has channels — don't overwrite
+            return  # Active channels exist in DB — don't overwrite
+
+        # Check if rows exist but all deactivated — don't re-insert
+        total = conn.execute(
+            "SELECT COUNT(*) c FROM channels"
+        ).fetchone()["c"]
+        if total > 0:
+            log.warning(
+                f"All {total} channels are deactivated. "
+                f"Use /channel_restore to reactivate."
+            )
+            return
+
+        # Insert env var channels
         for i, c in enumerate(_ENV_CHANNELS):
             conn.execute("""
                 INSERT INTO channels (name, price, link, position)
                 VALUES (?, ?, ?, ?)
             """, (c["name"], c["price"], c["link"], i))
-        if _ENV_CHANNELS:
-            log.info(f"Seeded {len(_ENV_CHANNELS)} channels from env vars into DB")
+        log.info(f"Seeded {len(_ENV_CHANNELS)} channels from env vars into DB")
 
 def upsert_user(u):
     with db() as conn:
@@ -1835,13 +1851,24 @@ async def cmd_start(update, context):
     
     paid_t1 = CHANNELS[0]["id"] in owned_channel_ids if CHANNELS else False
 
-    if not CHANNELS:
+    channels_now = get_channels()
+    if not channels_now:
+        # Try seeding from env one more time in case init was too early
+        seed_channels_from_env()
+        channels_now = get_channels()
+
+    if not channels_now:
         m = await context.bot.send_message(
-            user.id, "⚠️ No channels configured. Please contact admin.",
+            user.id,
+            "⚠️ No channels available right now. Please try again shortly.",
             protect_content=True,
             disable_notification=True,
         )
         track_msg(user.id, m.message_id)
+        log.error(
+            "cmd_start: no channels in DB and no env vars. "
+            "Set CHANNEL_1=Name|Price|Link in Railway variables."
+        )
         return
 
     rows = []
@@ -6933,6 +6960,8 @@ def main():
 
     # init_db FIRST — must run before anything queries CHANNELS
     init_db()
+    log.info(f"Channels in DB after init: {get_channels()}")
+    log.info(f"ENV channels found: {_ENV_CHANNELS}")
 
     if not CHANNELS:
         log.warning("No channels configured. Add one with /channel_add")
