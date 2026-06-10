@@ -83,14 +83,14 @@ def get_channels() -> list:
     try:
         with db() as conn:
             rows = conn.execute("""
-                SELECT id, name, price, link, position
+                SELECT id, name, price, link, position,
+                       group_label, separator_after
                 FROM channels
                 WHERE is_active=1
                 ORDER BY position ASC, id ASC
             """).fetchall()
         return [dict(r) for r in rows]
     except sqlite3.OperationalError:
-        # Table doesn't exist yet — init_db hasn't run. Return empty safely.
         return []
 
 # Module-level alias so all existing code using CHANNELS still works.
@@ -260,6 +260,17 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
+            CREATE TABLE IF NOT EXISTS channels (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                price           INTEGER NOT NULL,
+                link            TEXT NOT NULL,
+                is_active       INTEGER DEFAULT 1,
+                position        INTEGER DEFAULT 0,
+                group_label     TEXT DEFAULT NULL,
+                separator_after INTEGER DEFAULT 0,
+                created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         # Migration safety: add columns if upgrading from v2/v3
         try:
@@ -282,6 +293,7 @@ def init_db():
             conn.execute("ALTER TABLE purchases ADD COLUMN qr_code_id INTEGER")
         except sqlite3.OperationalError:
             pass
+        
 
     seed_channels_from_env()
 
@@ -988,6 +1000,10 @@ async def full_reset(context, user_id: int):
             if p["main_msg_id"]:
                 all_ids.add(p["main_msg_id"])
 
+    async def cb_noop(update, context):
+    """No-op callback for label/separator buttons — just dismiss the alert."""
+    await update.callback_query.answer()
+
     # Delete each known bot message — fast, no rate-limit risk
     deleted = 0
     for mid in all_ids:
@@ -1302,7 +1318,7 @@ async def cmd_channel_edit(update, context):
     field = args[1].lower()
     value_raw = " ".join(args[2:])
 
-    allowed = ("name", "price", "link", "position")
+    allowed = ("name", "price", "link", "position", "group_label", "separator_after")
     if field not in allowed:
         await update.message.reply_text(
             f"⚠️ Field must be one of: {', '.join(allowed)}"
@@ -1629,6 +1645,44 @@ def pick_qr_code() -> dict | None:
 
     return selected
 
+def build_channel_buttons(owned_channel_ids: set, is_paid: bool) -> list:
+    """Build channel button rows with group labels and separators.
+    
+    - Group labels render as a non-tappable header row above the channel
+    - separator_after adds a visual divider row after the channel
+    - owned channels → ✅ direct link
+    - unowned channels → 🔒 buy button (always visible)
+    - Access is tied to channel_id — position never affects access
+    """
+    rows = []
+    for c in CHANNELS:
+        # Group label row — non-tappable, acts as a section header
+        if c.get("group_label"):
+            rows.append([InlineKeyboardButton(
+                f"── {c['group_label']} ──",
+                callback_data="noop"
+            )])
+
+        # Channel button
+        if c["id"] in owned_channel_ids:
+            rows.append([InlineKeyboardButton(
+                f"✅ {c['name']}", url=c["link"]
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"🔒 {c['name']} — ₹{c['price']}",
+                callback_data=f"buy:{c['id']}",
+            )])
+
+        # Separator row after this channel
+        if c.get("separator_after"):
+            rows.append([InlineKeyboardButton(
+                "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+                callback_data="noop"
+            )])
+
+    return rows
+
 # ==================================================================
 # USER: /start
 # ==================================================================
@@ -1870,20 +1924,10 @@ async def cmd_start(update, context):
         intro = f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
         intro += f"<b>You have access to your purchased content.</b>"
         
-        # Single pass — owned = ✅ direct link, unowned = 🔒 buy button
-        # Unowned channels are NEVER hidden — user can always purchase more
-        for c in CHANNELS:
-            if c["id"] in owned_channel_ids:
-                rows.append([InlineKeyboardButton(
-                    f"✅ {c['name']}", url=c["link"]
-                )])
-            else:
-                rows.append([InlineKeyboardButton(
-                    f"🔒 {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
-                )])
+        # Channel buttons with grouping/separators — access tied to channel_id
+        rows.extend(build_channel_buttons(owned_channel_ids, paid_t1))
 
-        # Owned bundles — single ✅ button → direct bundle link
+        # Owned bundles
         for price in sorted(owned_bundle_prices):
             if price in BUNDLES:
                 bundle = BUNDLES[price]
@@ -3098,19 +3142,8 @@ async def cb_admin(update, context):
                     f"✅ {bundle['name']} — Join", url=bundle["link"]
                 )])
         else:
-            # All owned channels (just-approved + previously owned) → single ✅ button
-            # All unowned channels → ⭐ buy button, always visible
             all_owned = get_owned_channel_ids(user_id)
-            for c in CHANNELS:
-                if c["id"] in all_owned:
-                    kb_rows.append([InlineKeyboardButton(
-                        f"✅ {c['name']}", url=c["link"]
-                    )])
-                else:
-                    kb_rows.append([InlineKeyboardButton(
-                        f"⭐ {c['name']} — ₹{c['price']}",
-                        callback_data=f"buy:{c['id']}",
-                    )])
+            kb_rows.extend(build_channel_buttons(all_owned, True))
         
         kb = InlineKeyboardMarkup(kb_rows)
 
@@ -3267,26 +3300,13 @@ async def cb_admin(update, context):
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
                 else:
-                    # Owned channels → single ✅ button → direct channel link
-                    # Unowned channels → 🔒 buy button, always visible
                     intro = f"👋 <b>Welcome back!</b>\n\n<b>You have access to your purchased content.</b>"
 
-                    for c in CHANNELS:
-                        if c["id"] in owned_channel_ids:
-                            rows.append([InlineKeyboardButton(
-                                f"✅ {c['name']}", url=c["link"]
-                            )])
-                        else:
-                            price = c["price"]
-                            rows.append([InlineKeyboardButton(
-                                f"🔒 {c['name']} — ₹{price}",
-                                callback_data=f"buy:{c['id']}",
-                            )])
+                    rows.extend(build_channel_buttons(owned_channel_ids, True))
 
-                    # Owned bundles
-                    for price in sorted(owned_bundle_prices):
-                        if price in BUNDLES:
-                            bundle = BUNDLES[bundle_price]
+                    for bp in sorted(owned_bundle_prices):
+                        if bp in BUNDLES:
+                            bundle = BUNDLES[bp]
                             rows.append([InlineKeyboardButton(
                                 f"✅ {bundle['name']}", url=bundle["link"]
                             )])
@@ -3948,16 +3968,7 @@ async def cmd_approve(update, context):
                 f"✅ {bundle['name']}", url=bundle["link"]
             )])
     else:
-        for c in CHANNELS:
-            if c["id"] in all_owned:
-                kb_rows.append([InlineKeyboardButton(
-                    f"✅ {c['name']}", url=c["link"]
-                )])
-            else:
-                kb_rows.append([InlineKeyboardButton(
-                    f"🔒 {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
-                )])
+        kb_rows.extend(build_channel_buttons(all_owned, True))
 
     kb = InlineKeyboardMarkup(kb_rows)
     approval_text = (
@@ -4558,6 +4569,120 @@ async def cmd_qr_stats(update, context):
     await update.message.reply_html(text)
 
 
+async def cmd_channel_group(update, context):
+    """Admin: /channel_group <id> <label>
+    
+    Set a group label shown as a header above this channel.
+    Use 'none' to remove the label.
+    
+    Examples:
+    /channel_group 1 🎬 Entertainment
+    /channel_group 3 💎 Premium
+    /channel_group 5 none
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_html(
+            "Usage: <code>/channel_group &lt;id&gt; &lt;label&gt;</code>\n\n"
+            "Examples:\n"
+            "<code>/channel_group 1 🎬 Entertainment</code>\n"
+            "<code>/channel_group 3 💎 Premium</code>\n"
+            "<code>/channel_group 5 none</code> — remove label"
+        )
+        return
+
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid channel ID.")
+        return
+
+    label_raw = " ".join(args[1:])
+    label = None if label_raw.lower() == "none" else label_raw
+
+    with db() as conn:
+        r = conn.execute(
+            "SELECT name FROM channels WHERE id=?", (channel_id,)
+        ).fetchone()
+        if not r:
+            await update.message.reply_text(f"⚠️ Channel ID {channel_id} not found.")
+            return
+        conn.execute(
+            "UPDATE channels SET group_label=? WHERE id=?",
+            (label, channel_id)
+        )
+
+    if label:
+        await update.message.reply_html(
+            f"✅ <b>Group Label Set</b>\n\n"
+            f"Channel : {r['name']} (ID {channel_id})\n"
+            f"Label   : {label}\n\n"
+            f"<i>Header appears above this channel in the menu.</i>"
+        )
+    else:
+        await update.message.reply_html(
+            f"✅ Group label removed from {r['name']} (ID {channel_id})."
+        )
+
+
+async def cmd_channel_separator(update, context):
+    """Admin: /channel_separator <id> <on|off>
+    
+    Add or remove a visual separator line after a channel button.
+    Useful for spacing between groups.
+    
+    Examples:
+    /channel_separator 2 on
+    /channel_separator 2 off
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_html(
+            "Usage: <code>/channel_separator &lt;id&gt; &lt;on|off&gt;</code>\n\n"
+            "Adds a visual divider line after the channel button.\n\n"
+            "Examples:\n"
+            "<code>/channel_separator 2 on</code>\n"
+            "<code>/channel_separator 2 off</code>"
+        )
+        return
+
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid channel ID.")
+        return
+
+    action = args[1].lower()
+    if action not in ("on", "off"):
+        await update.message.reply_text("Use: on or off")
+        return
+
+    value = 1 if action == "on" else 0
+
+    with db() as conn:
+        r = conn.execute(
+            "SELECT name FROM channels WHERE id=?", (channel_id,)
+        ).fetchone()
+        if not r:
+            await update.message.reply_text(f"⚠️ Channel ID {channel_id} not found.")
+            return
+        conn.execute(
+            "UPDATE channels SET separator_after=? WHERE id=?",
+            (value, channel_id)
+        )
+
+    status = "✅ ON" if value else "🚫 OFF"
+    await update.message.reply_html(
+        f"<b>Separator after {r['name']}:</b> {status}\n\n"
+        f"<i>Visible in menu immediately.</i>"
+    )
+
 _HELP_DETAILS = {
     "stats":     ("<b>/stats</b>\n\nOverall bot totals.\n\n"
                   "Shows total users, approved revenue, and purchase count per status "
@@ -4753,11 +4878,22 @@ _HELP_DETAILS = {
                     "<b>Example:</b> <code>/qr_restore 3</code>"),
     "qr_stats":    ("<b>/qr_stats</b>\n\nUsage breakdown per QR with percentage bar.\n\n"
                     "<b>Example:</b> <code>/qr_stats</code>"),
+    "channel_group":     ("<b>/channel_group &lt;id&gt; &lt;label&gt;</b>\n\n"
+                          "Set a section header shown above a channel button. "
+                          "Use 'none' to remove.\n\n"
+                          "<b>Examples:</b>\n"
+                          "<code>/channel_group 1 🎬 Entertainment</code>\n"
+                          "<code>/channel_group 5 none</code>"),
+    "channel_separator": ("<b>/channel_separator &lt;id&gt; &lt;on|off&gt;</b>\n\n"
+                          "Add a visual divider line after a channel button.\n\n"
+                          "<b>Examples:</b>\n"
+                          "<code>/channel_separator 2 on</code>\n"
+                          "<code>/channel_separator 2 off</code>"),
 }
 
 _HELP_SECTIONS = [
     ("📊 Stats & Reports",      ["stats", "pending", "summary", "listusers", "find", "whoami", "unpaid"]),
-    ("📺 Channels",             ["channel_list", "channel_add", "channel_edit", "channel_remove", "channel_restore"]),
+    ("📺 Channels", ["channel_list", "channel_add", "channel_edit", "channel_remove", "channel_restore", "channel_group", "channel_separator"]),
     ("💳 QR Codes",             ["qr_list", "qr_mode", "qr_priority", "qr_active", "qr_remove", "qr_restore", "qr_stats"]),
     ("🧹 Cleanup (single)",     ["wipe", "reset", "resetme"]),
     ("☢️ Cleanup (ALL)",        ["wipeall", "resetall"]),
@@ -6884,6 +7020,9 @@ def main():
     app.add_handler(CommandHandler("qr_remove",   cmd_qr_remove))
     app.add_handler(CommandHandler("qr_restore",  cmd_qr_restore))
     app.add_handler(CommandHandler("qr_stats",    cmd_qr_stats))
+    app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
+    app.add_handler(CommandHandler("channel_group",     cmd_channel_group))
+    app.add_handler(CommandHandler("channel_separator", cmd_channel_separator))
 
 
     jq = app.job_queue
