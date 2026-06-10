@@ -1746,20 +1746,14 @@ def build_channel_buttons(owned_channel_ids: set,
             )])
 
         if unpaid_mode:
-            if tier_gate:
-                # Tier gate on — only first channel is the entry point
-                if idx == 0:
-                    rows.append([InlineKeyboardButton(
-                        f"⭐ {c['name']} — ₹{c['price']}",
-                        callback_data=f"buy:{c_id}",
-                    )])
-                # Hidden channels still get their separator below
-            else:
-                # Tier gate off — every channel purchasable directly
-                rows.append([InlineKeyboardButton(
-                    f"⭐ {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c_id}",
-                )])
+            if tier_gate and idx > 0:
+                # Tier gate on — only show entry point (idx=0), skip rest
+                # Skip separator too — no orphaned dividers
+                continue
+            rows.append([InlineKeyboardButton(
+                f"⭐ {c['name']} — ₹{c['price']}",
+                callback_data=f"buy:{c_id}",
+            )])
         else:
             # Paid flow — owned → ✅ direct link, unowned → 🔒 buy
             if c_id in owned_int:
@@ -1998,7 +1992,9 @@ async def cmd_start(update, context):
             except (ValueError, TypeError):
                 pass
     
-    paid_t1 = CHANNELS[0]["id"] in owned_channel_ids if CHANNELS else False
+    # paid_t1 = user owns ANY channel — never position-dependent
+    # Position changes must never affect access detection
+    paid_t1 = bool(owned_channel_ids) or bool(owned_bundle_prices)
 
     if not CHANNELS:
         log.error(
@@ -2076,8 +2072,15 @@ async def cmd_start(update, context):
     else:
         # ====== TIER 1+ OWNER FLOW ======
         # Show: Owned channels + Owned bundles + Available upgrades
-        intro = f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
-        intro += f"<b>You have access to your purchased content.</b>"
+        owned_names = [
+            c["name"] for c in get_channels()
+            if c["id"] in owned_channel_ids
+        ]
+        intro = (
+            f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
+            f"<b>You have access to your purchased content.\n"
+            f"Tap any ✅ button below to join.</b>"
+        )
         
         # Channel buttons — position, group labels, separators from DB
         rows.extend(build_channel_buttons(
@@ -2349,18 +2352,27 @@ async def cb_buy(update, context):
     if not channel:
         return
 
-    # Already owned — edit the menu in-place to show join button
+    # Already owned — answer with popup only, no extra button needed.
+    # build_channel_buttons gives owned channels a url= button so cb_buy
+    # should rarely fire for owned channels — but handle it gracefully.
     if cid in get_owned_channel_ids(user.id):
+        await q.answer(
+            "✅ You already have access! Use the green tick button to join.",
+            show_alert=True
+        )
+        # Rebuild the menu in-place so owned channel shows ✅ url button
+        owned_now = get_owned_channel_ids(q.from_user.id)
+        fresh_rows = build_channel_buttons(
+            owned_channel_ids=owned_now,
+            is_paid=True,
+            unpaid_mode=False,
+        )
         try:
-            await q.edit_message_text(
-                text=f"✅ <b>{channel['name']}</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔓 Join", url=channel["link"])
-                ]]),
+            await q.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(fresh_rows)
             )
         except Exception as e:
-            log.debug(f"already-owned edit failed: {e}")
+            log.debug(f"owned channel menu refresh failed: {e}")
         return
 
     # TIER 1 MANDATORY CHECK: only enforce if gate is enabled
