@@ -297,9 +297,22 @@ def init_db():
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE channels ADD COLUMN group_label TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE channels ADD COLUMN separator_after INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE purchases ADD COLUMN qr_code_id INTEGER")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("ALTER TABLE purchases ADD COLUMN qr_code_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        
         
 
     seed_channels_from_env()
@@ -1491,9 +1504,12 @@ async def cmd_channel_list(update, context):
     text = f"📺 <b>All Channels ({len(rows)})</b>\n\n"
     for r in rows:
         status = "✅" if r["is_active"] else "🚫"
+        group = r["group_label"] or "—"
+        sep = "on" if r["separator_after"] else "off"
         text += (
             f"{status} <b>ID {r['id']}</b> — {r['name']}\n"
             f"   💰 ₹{r['price']} | 📌 pos {r['position']}\n"
+            f"   🏷 Group: {group} | ┄ Sep: {sep}\n"
             f"   🔗 <code>{r['link']}</code>\n\n"
         )
 
@@ -1671,6 +1687,57 @@ def pick_qr_code() -> dict | None:
 def build_channel_buttons(owned_channel_ids: set,
                           is_paid: bool,
                           unpaid_mode: bool = False) -> list:
+    """Build channel button rows from DB — always reads fresh position,
+    group_label and separator_after. Access tied to channel_id, not position."""
+    channels = get_channels()  # fresh from DB, sorted by position
+    tier_gate = is_tier_gate_enabled()
+    rows = []
+
+    for idx, c in enumerate(channels):
+        # Group label — non-tappable section header above this channel
+        label = c.get("group_label") or ""
+        if label.strip():
+            rows.append([InlineKeyboardButton(
+                f"── {label.strip()} ──",
+                callback_data="noop"
+            )])
+
+        if unpaid_mode:
+            if tier_gate:
+                # Only show the first channel as entry point
+                if idx == 0:
+                    rows.append([InlineKeyboardButton(
+                        f"⭐ {c['name']} — ₹{c['price']}",
+                        callback_data=f"buy:{c['id']}",
+                    )])
+                # Still render separator even for hidden channels
+            else:
+                # Tier gate off — all channels purchasable
+                rows.append([InlineKeyboardButton(
+                    f"⭐ {c['name']} — ₹{c['price']}",
+                    callback_data=f"buy:{c['id']}",
+                )])
+        else:
+            # Paid flow — owned=✅ direct link, unowned=🔒 buy
+            if c["id"] in owned_channel_ids:
+                rows.append([InlineKeyboardButton(
+                    f"✅ {c['name']}", url=c["link"]
+                )])
+            else:
+                rows.append([InlineKeyboardButton(
+                    f"🔒 {c['name']} — ₹{c['price']}",
+                    callback_data=f"buy:{c['id']}",
+                )])
+
+        # Separator after this channel
+        sep = c.get("separator_after")
+        if sep and int(sep) == 1:
+            rows.append([InlineKeyboardButton(
+                "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+                callback_data="noop"
+            )])
+
+    return rows
     """Build channel button rows respecting position, group labels, separators.
 
     unpaid_mode=True  → show purchasable ⭐ buttons for all channels
@@ -4631,16 +4698,7 @@ async def cmd_qr_stats(update, context):
 
 
 async def cmd_channel_group(update, context):
-    """Admin: /channel_group <id> <label>
-    
-    Set a group label shown as a header above this channel.
-    Use 'none' to remove the label.
-    
-    Examples:
-    /channel_group 1 🎬 Entertainment
-    /channel_group 3 💎 Premium
-    /channel_group 5 none
-    """
+    """Admin: /channel_group <id> <label|none>"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -4651,7 +4709,7 @@ async def cmd_channel_group(update, context):
             "Examples:\n"
             "<code>/channel_group 1 🎬 Entertainment</code>\n"
             "<code>/channel_group 3 💎 Premium</code>\n"
-            "<code>/channel_group 5 none</code> — remove label"
+            "<code>/channel_group 1 none</code> — remove label"
         )
         return
 
@@ -4661,7 +4719,7 @@ async def cmd_channel_group(update, context):
         await update.message.reply_text("⚠️ Invalid channel ID.")
         return
 
-    label_raw = " ".join(args[1:])
+    label_raw = " ".join(args[1:]).strip()
     label = None if label_raw.lower() == "none" else label_raw
 
     with db() as conn:
@@ -4669,7 +4727,10 @@ async def cmd_channel_group(update, context):
             "SELECT name FROM channels WHERE id=?", (channel_id,)
         ).fetchone()
         if not r:
-            await update.message.reply_text(f"⚠️ Channel ID {channel_id} not found.")
+            await update.message.reply_text(
+                f"⚠️ Channel ID {channel_id} not found. "
+                f"Use /channel_list to see valid IDs."
+            )
             return
         conn.execute(
             "UPDATE channels SET group_label=? WHERE id=?",
@@ -4681,24 +4742,17 @@ async def cmd_channel_group(update, context):
             f"✅ <b>Group Label Set</b>\n\n"
             f"Channel : {r['name']} (ID {channel_id})\n"
             f"Label   : {label}\n\n"
-            f"<i>Header appears above this channel in the menu.</i>"
+            f"<i>Appears as a header above this channel in the menu.\n"
+            f"Users will see it on next /start.</i>"
         )
     else:
         await update.message.reply_html(
-            f"✅ Group label removed from {r['name']} (ID {channel_id})."
+            f"✅ Group label removed from <b>{r['name']}</b> (ID {channel_id}).\n\n"
+            f"<i>Takes effect on next /start.</i>"
         )
 
-
 async def cmd_channel_separator(update, context):
-    """Admin: /channel_separator <id> <on|off>
-    
-    Add or remove a visual separator line after a channel button.
-    Useful for spacing between groups.
-    
-    Examples:
-    /channel_separator 2 on
-    /channel_separator 2 off
-    """
+    """Admin: /channel_separator <id> <on|off>"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -4721,7 +4775,7 @@ async def cmd_channel_separator(update, context):
 
     action = args[1].lower()
     if action not in ("on", "off"):
-        await update.message.reply_text("Use: on or off")
+        await update.message.reply_text("⚠️ Use: on or off")
         return
 
     value = 1 if action == "on" else 0
@@ -4731,7 +4785,10 @@ async def cmd_channel_separator(update, context):
             "SELECT name FROM channels WHERE id=?", (channel_id,)
         ).fetchone()
         if not r:
-            await update.message.reply_text(f"⚠️ Channel ID {channel_id} not found.")
+            await update.message.reply_text(
+                f"⚠️ Channel ID {channel_id} not found. "
+                f"Use /channel_list to see valid IDs."
+            )
             return
         conn.execute(
             "UPDATE channels SET separator_after=? WHERE id=?",
@@ -4741,7 +4798,7 @@ async def cmd_channel_separator(update, context):
     status = "✅ ON" if value else "🚫 OFF"
     await update.message.reply_html(
         f"<b>Separator after {r['name']}:</b> {status}\n\n"
-        f"<i>Visible in menu immediately.</i>"
+        f"<i>Visible in menu on next /start.</i>"
     )
 
 _HELP_DETAILS = {
@@ -7090,6 +7147,9 @@ def main():
     app.add_handler(CommandHandler("channel_remove",  cmd_channel_remove))
     app.add_handler(CommandHandler("channel_restore", cmd_channel_restore))
     app.add_handler(CommandHandler("channel_list",    cmd_channel_list))
+    app.add_handler(CommandHandler("channel_group",     cmd_channel_group))
+    app.add_handler(CommandHandler("channel_separator", cmd_channel_separator))
+    app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
     app.add_handler(CommandHandler("qr_list",     cmd_qr_list))
     app.add_handler(CommandHandler("qr_mode",     cmd_qr_mode))
     app.add_handler(CommandHandler("qr_priority", cmd_qr_priority))
@@ -7097,9 +7157,6 @@ def main():
     app.add_handler(CommandHandler("qr_remove",   cmd_qr_remove))
     app.add_handler(CommandHandler("qr_restore",  cmd_qr_restore))
     app.add_handler(CommandHandler("qr_stats",    cmd_qr_stats))
-    app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
-    app.add_handler(CommandHandler("channel_group",     cmd_channel_group))
-    app.add_handler(CommandHandler("channel_separator", cmd_channel_separator))
 
 
     jq = app.job_queue
