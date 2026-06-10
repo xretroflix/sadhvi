@@ -79,7 +79,7 @@ for i in range(1, 11):
         _ENV_CHANNELS.append(c)
 
 def get_channels() -> list:
-    """Live channel list from DB. Always up to date — no restart needed."""
+    """Live channel list from DB. Falls back to env vars if DB is empty."""
     try:
         with db() as conn:
             rows = conn.execute("""
@@ -89,9 +89,16 @@ def get_channels() -> list:
                 WHERE is_active=1
                 ORDER BY position ASC, id ASC
             """).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        if result:
+            return result
+        # DB empty — fall back to env vars so bot stays functional
+        log.warning("No channels in DB — falling back to env var channels.")
+        return _ENV_CHANNELS
     except sqlite3.OperationalError:
-        return []
+        # Table doesn't exist yet — fall back to env vars
+        log.warning("Channels table missing — falling back to env var channels.")
+        return _ENV_CHANNELS
 
 # Module-level alias so all existing code using CHANNELS still works.
 # Every access re-queries DB so changes are instant.
@@ -1851,13 +1858,12 @@ async def cmd_start(update, context):
     
     paid_t1 = CHANNELS[0]["id"] in owned_channel_ids if CHANNELS else False
 
-    channels_now = get_channels()
-    if not channels_now:
-        # Try seeding from env one more time in case init was too early
-        seed_channels_from_env()
-        channels_now = get_channels()
-
-    if not channels_now:
+    if not CHANNELS:
+        log.error(
+            f"cmd_start: no channels for user {user.id}. "
+            f"ENV channels: {len(_ENV_CHANNELS)}, "
+            f"DB channels: {len(get_channels())}"
+        )
         m = await context.bot.send_message(
             user.id,
             "⚠️ No channels available right now. Please try again shortly.",
@@ -1865,10 +1871,6 @@ async def cmd_start(update, context):
             disable_notification=True,
         )
         track_msg(user.id, m.message_id)
-        log.error(
-            "cmd_start: no channels in DB and no env vars. "
-            "Set CHANNEL_1=Name|Price|Link in Railway variables."
-        )
         return
 
     rows = []
@@ -6960,11 +6962,25 @@ def main():
 
     # init_db FIRST — must run before anything queries CHANNELS
     init_db()
-    log.info(f"Channels in DB after init: {get_channels()}")
-    log.info(f"ENV channels found: {_ENV_CHANNELS}")
 
-    if not CHANNELS:
-        log.warning("No channels configured. Add one with /channel_add")
+    # Startup diagnostics — always visible in Railway logs
+    log.info(f"ENV channels detected: {len(_ENV_CHANNELS)}")
+    for c in _ENV_CHANNELS:
+        log.info(f"  ENV channel: {c}")
+
+    db_channels = get_channels()
+    log.info(f"DB channels loaded: {len(db_channels)}")
+    for c in db_channels:
+        log.info(f"  DB channel: {c}")
+
+    if not db_channels:
+        log.error(
+            "STARTUP: No channels available. "
+            "Set CHANNEL_1=Name|Price|Link in Railway variables "
+            "or use /channel_add after the bot starts."
+        )
+    else:
+        log.info(f"STARTUP: {len(db_channels)} channel(s) ready.")
     app = Application.builder().token(BOT_TOKEN).build()
 
     # User
