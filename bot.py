@@ -1000,7 +1000,7 @@ async def full_reset(context, user_id: int):
             if p["main_msg_id"]:
                 all_ids.add(p["main_msg_id"])
 
-    async def cb_noop(update, context):
+async def cb_noop(update, context):
     """No-op callback for label/separator buttons — just dismiss the alert."""
     await update.callback_query.answer()
 
@@ -2159,11 +2159,9 @@ async def cb_back_to_start(update, context):
     q = update.callback_query
     await q.answer()
     user = q.from_user
-    reset_inactivity_timer(context, user.id)
     
     if is_blocked(user.id):
         return
-    reset_inactivity_timer(context, user.id)
     
     try:
         await q.delete_message()
@@ -2172,6 +2170,11 @@ async def cb_back_to_start(update, context):
     
     # Trigger /start flow
     await cmd_start(update, context)
+
+
+async def cb_noop(update, context):
+    """No-op callback for label/separator buttons — just dismiss the alert."""
+    await update.callback_query.answer()
 
 
 # ==================================================================
