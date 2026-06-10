@@ -1668,36 +1668,65 @@ def pick_qr_code() -> dict | None:
 
     return selected
 
-def build_channel_buttons(owned_channel_ids: set, is_paid: bool) -> list:
-    """Build channel button rows with group labels and separators.
-    
-    - Group labels render as a non-tappable header row above the channel
-    - separator_after adds a visual divider row after the channel
-    - owned channels → ✅ direct link
-    - unowned channels → 🔒 buy button (always visible)
-    - Access is tied to channel_id — position never affects access
+def build_channel_buttons(owned_channel_ids: set,
+                          is_paid: bool,
+                          unpaid_mode: bool = False) -> list:
+    """Build channel button rows respecting position, group labels, separators.
+
+    unpaid_mode=True  → show purchasable ⭐ buttons for all channels
+    unpaid_mode=False → owned=✅ direct link, unowned=🔒 buy button
+
+    Group labels and separators always apply regardless of mode.
+    Access is tied to channel_id — position never affects access.
     """
+    channels = get_channels()  # always fresh from DB — respects position order
+    tier_gate = is_tier_gate_enabled()
     rows = []
-    for c in CHANNELS:
-        # Group label row — non-tappable, acts as a section header
+
+    for c in channels:
+        # Group label — non-tappable section header
         if c.get("group_label"):
             rows.append([InlineKeyboardButton(
                 f"── {c['group_label']} ──",
                 callback_data="noop"
             )])
 
-        # Channel button
-        if c["id"] in owned_channel_ids:
-            rows.append([InlineKeyboardButton(
-                f"✅ {c['name']}", url=c["link"]
-            )])
+        if unpaid_mode:
+            # Unpaid user — all channels show as purchasable
+            if tier_gate and channels and c["id"] == channels[0]["id"]:
+                # Tier gate on — only show first channel as entry point
+                rows.append([InlineKeyboardButton(
+                    f"⭐ {c['name']} — ₹{c['price']}",
+                    callback_data=f"buy:{c['id']}",
+                )])
+            elif not tier_gate:
+                # Tier gate off — all channels purchasable directly
+                rows.append([InlineKeyboardButton(
+                    f"⭐ {c['name']} — ₹{c['price']}",
+                    callback_data=f"buy:{c['id']}",
+                )])
+            else:
+                # Tier gate on, not first channel — skip
+                # Still add separator if set
+                if c.get("separator_after"):
+                    rows.append([InlineKeyboardButton(
+                        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+                        callback_data="noop"
+                    )])
+                continue
         else:
-            rows.append([InlineKeyboardButton(
-                f"🔒 {c['name']} — ₹{c['price']}",
-                callback_data=f"buy:{c['id']}",
-            )])
+            # Paid user — owned=✅, unowned=🔒
+            if c["id"] in owned_channel_ids:
+                rows.append([InlineKeyboardButton(
+                    f"✅ {c['name']}", url=c["link"]
+                )])
+            else:
+                rows.append([InlineKeyboardButton(
+                    f"🔒 {c['name']} — ₹{c['price']}",
+                    callback_data=f"buy:{c['id']}",
+                )])
 
-        # Separator row after this channel
+        # Separator after this channel
         if c.get("separator_after"):
             rows.append([InlineKeyboardButton(
                 "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
@@ -1877,74 +1906,58 @@ async def cmd_start(update, context):
     
     if not paid_t1:
         # ====== UNPAID USER FLOW ======
-        # Show: Tier 1 (CORE) + Fallback Bundles (if enabled by admin)
-        
-        # 1. Show Multi-Tier Entry Points (if enabled) or Single Tier
         if MULTI_TIER_ENABLED and TIER_OFFERS:
             # ========== MULTI-TIER 3×3 MATRIX WITH COMBOS ==========
             tier_ids = sorted(TIER_OFFERS.keys())
             row_number = 0
-            
             for i in range(0, len(tier_ids), 3):
                 row_number += 1
                 row = []
-                
-                # Add up to 3 tier buttons per row
                 for j in range(3):
                     if i + j < len(tier_ids):
                         tier_id = tier_ids[i + j]
                         tier_info = TIER_OFFERS[tier_id]
-                        btn_text = f"{tier_info['emoji']}\n{tier_info['label']}\n₹{tier_info['price']}"
-                        row.append(
-                            InlineKeyboardButton(
-                                btn_text,
-                                callback_data=f"buy_tier:{tier_id}"
-                            )
-                        )
-                
+                        btn_text = (f"{tier_info['emoji']}\n"
+                                    f"{tier_info['label']}\n"
+                                    f"₹{tier_info['price']}")
+                        row.append(InlineKeyboardButton(
+                            btn_text, callback_data=f"buy_tier:{tier_id}"
+                        ))
                 if row:
                     rows.append(row)
-                
-                # Insert combo button after this row (if configured for this position)
                 for combo_id in sorted(COMBO_OFFERS.keys()):
                     combo_info = COMBO_OFFERS[combo_id]
                     if combo_info.get("position") == row_number:
-                        combo_text = f"{combo_info['emoji']} {combo_info['label']}\n₹{combo_info['price']}"
-                        rows.append([
-                            InlineKeyboardButton(
-                                combo_text,
-                                callback_data=f"buy_combo:{combo_id}"
-                            )
-                        ])
-            
-            intro = f"👋 <b>Hi {user.first_name}!</b>\n\n<b>Choose Your Entry Point</b>\n\nSelect the tier that works best for you:"
-        
+                        combo_text = (f"{combo_info['emoji']} "
+                                      f"{combo_info['label']}\n"
+                                      f"₹{combo_info['price']}")
+                        rows.append([InlineKeyboardButton(
+                            combo_text, callback_data=f"buy_combo:{combo_id}"
+                        )])
+            intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
+                     f"<b>Choose Your Entry Point</b>\n\n"
+                     f"Select the tier that works best for you:")
+
         else:
-            # ========== DEFAULT SINGLE-TIER MODE ==========
+            # ========== DEFAULT MODE — use build_channel_buttons ==========
+            # Respects position, group_label, separator_after from DB
             if is_tier_gate_enabled():
-                # Show only Tier 1 entry point
-                c = CHANNELS[0]
-                price = c["price"]
-                rows.append([InlineKeyboardButton(
-                    f"⭐ Enjoy 15+ Channels — ₹{price}",
-                    callback_data=f"buy:{c['id']}",
-                )])
                 intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
-                         f"<b>Get started with {c['name']} at ₹{price}</b>")
+                         f"<b>Get started below:</b>")
             else:
-                # Gate off — show ALL channels directly
                 intro = (f"👋 <b>Hi {user.first_name}!</b>\n\n"
                          f"<b>Choose any channel to get started:</b>")
-                for c in CHANNELS:
-                    rows.append([InlineKeyboardButton(
-                        f"⭐ {c['name']} — ₹{c['price']}",
-                        callback_data=f"buy:{c['id']}",
-                    )])
-        
-        # 2. Add Fallback Bundle Offers (if admin enabled them and not multi-tier)
+
+            rows.extend(build_channel_buttons(
+                owned_channel_ids=set(),
+                is_paid=False,
+                unpaid_mode=True,
+            ))
+
+        # Fallback bundles (if enabled and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
             rows.append([InlineKeyboardButton(
-                "⭐⭐ MALLU PREMIUM - 299 ⭐⭐", callback_data="fallback_menu"
+                "📦 See Budget Bundles", callback_data="fallback_menu"
             )])
 
     else:
@@ -1953,8 +1966,12 @@ async def cmd_start(update, context):
         intro = f"👋 <b>Welcome back, {user.first_name}!</b>\n\n"
         intro += f"<b>You have access to your purchased content.</b>"
         
-        # Channel buttons with grouping/separators — access tied to channel_id
-        rows.extend(build_channel_buttons(owned_channel_ids, paid_t1))
+        # Channel buttons — position, group labels, separators from DB
+        rows.extend(build_channel_buttons(
+            owned_channel_ids=owned_channel_ids,
+            is_paid=True,
+            unpaid_mode=False,
+        ))
 
         # Owned bundles
         for price in sorted(owned_bundle_prices):
@@ -3175,7 +3192,11 @@ async def cb_admin(update, context):
                 )])
         else:
             all_owned = get_owned_channel_ids(user_id)
-            kb_rows.extend(build_channel_buttons(all_owned, True))
+            kb_rows.extend(build_channel_buttons(
+                owned_channel_ids=all_owned,
+                is_paid=True,
+                unpaid_mode=False,
+            ))
         
         kb = InlineKeyboardMarkup(kb_rows)
 
@@ -3334,7 +3355,11 @@ async def cb_admin(update, context):
                 else:
                     intro = f"👋 <b>Welcome back!</b>\n\n<b>You have access to your purchased content.</b>"
 
-                    rows.extend(build_channel_buttons(owned_channel_ids, True))
+                    rows.extend(build_channel_buttons(
+                        owned_channel_ids=owned_channel_ids,
+                        is_paid=True,
+                        unpaid_mode=False,
+                    ))
 
                     for bp in sorted(owned_bundle_prices):
                         if bp in BUNDLES:
@@ -4000,7 +4025,11 @@ async def cmd_approve(update, context):
                 f"✅ {bundle['name']}", url=bundle["link"]
             )])
     else:
-        kb_rows.extend(build_channel_buttons(all_owned, True))
+        kb_rows.extend(build_channel_buttons(
+            owned_channel_ids=all_owned,
+            is_paid=True,
+            unpaid_mode=False,
+        ))
 
     kb = InlineKeyboardMarkup(kb_rows)
     approval_text = (
