@@ -1031,12 +1031,14 @@ def cancel_inactivity_timer(context, user_id):
 
 
 def reset_user_data(user_id: int):
-    """Delete all purchases + reset menu/main message refs for a user."""
+    """Delete all purchases + reset all message refs for a user."""
     with db() as conn:
         conn.execute("DELETE FROM purchases WHERE user_id=?", (user_id,))
         conn.execute(
             "UPDATE users SET tracked_msgs='[]', menu_msg_id=NULL "
             "WHERE user_id=?", (user_id,))
+    # Clear in-memory UPI capture state
+    AWAITING_UPI.pop(user_id, None)
 
 async def full_reset(context, user_id: int):
     """Wipe ALL bot messages from user's chat AND reset DB state.
@@ -1060,10 +1062,6 @@ async def full_reset(context, user_id: int):
             if p["main_msg_id"]:
                 all_ids.add(p["main_msg_id"])
 
-async def cb_noop(update, context):
-    """No-op callback for label/separator buttons — just dismiss the alert."""
-    await update.callback_query.answer()
-
     # Delete each known bot message — fast, no rate-limit risk
     deleted = 0
     for mid in all_ids:
@@ -1077,6 +1075,10 @@ async def cb_noop(update, context):
 
     # Wipe all DB state
     reset_user_data(user_id)
+
+async def cb_noop(update, context):
+    """No-op callback for label/separator buttons — just dismiss the alert."""
+    await update.callback_query.answer()
 
 async def cmd_proof_mode(update, context):
     """Admin: /proof_mode <upi|screenshot|both|none>
@@ -1929,7 +1931,7 @@ def build_multi_tier_keyboard():
     # Add bundle offers button if configured
     if os.getenv("BUNDLE_1"):
         keyboard.append([
-            InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")
+            InlineKeyboardButton("🎁 See Bundle Offers", callback_data="show_bundles")
         ])
     
     # Add back button
@@ -1943,7 +1945,7 @@ def build_single_tier_keyboard():
     """Build default single-tier keyboard (₹99 entry point)."""
     keyboard = [
         [InlineKeyboardButton("⭐ Enjoy 15+ Channels — ₹99", callback_data="buy_tier:1")],
-        [InlineKeyboardButton("📦 See Bundle Offers", callback_data="show_bundles")],
+        [InlineKeyboardButton("🎁 See Bundle Offers", callback_data="show_bundles")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -2066,7 +2068,7 @@ async def cmd_start(update, context):
         # Fallback bundles (if enabled and not multi-tier)
         if is_fallback_enabled() and not (MULTI_TIER_ENABLED and TIER_OFFERS):
             rows.append([InlineKeyboardButton(
-                "📦 See Budget Bundles", callback_data="fallback_menu"
+                "🎁 See Budget Bundles", callback_data="fallback_menu"
             )])
 
     else:
@@ -3473,7 +3475,7 @@ async def cb_admin(update, context):
                     )])
                     if is_fallback_enabled():
                         rows.append([InlineKeyboardButton(
-                            "📦 See Budget Bundles", callback_data="fallback_menu"
+                            "🎁 See Budget Bundles", callback_data="fallback_menu"
                         )])
                     intro = (f"👋 <b>Hi there!</b>\n\n"
                              f"<b>Get started with {c['name']} at ₹{price}</b>")
@@ -3673,31 +3675,58 @@ async def cmd_pending(update, context):
     )
 
 async def cmd_reset(update, context):
-    """Admin: /reset <user_id> — full nuclear reset of a user.
-    Wipes all bot messages in their chat AND clears all DB state.
-    User's chat looks pristine — they /start again like brand new."""
+    """Admin: /reset <user_id> — full nuclear reset of a user."""
     if update.effective_user.id != ADMIN_ID:
         return
+
     args = context.args or []
     if not args:
-        await update.message.reply_text(
-            "Usage: <code>/reset &lt;user_id&gt;</code>\n"
-            "Or use /resetme to reset your own account.",
-            parse_mode=ParseMode.HTML,
+        await update.message.reply_html(
+            "Usage: <code>/reset &lt;user_id&gt;</code>\n\n"
+            "Or use <code>/resetme</code> to reset your own account."
         )
         return
+
     try:
         target_id = int(args[0])
     except ValueError:
         await update.message.reply_text("⚠️ Invalid user_id. Must be a number.")
         return
-    await full_reset(context, target_id)
-    await update.message.reply_html(
-        f"✅ <b>Full reset complete</b> for user <code>{target_id}</code>.\n\n"
-        f"All bot messages deleted, all DB state cleared.\n"
-        f"<i>(Their own /start text remains — Telegram doesn't allow bots "
-        f"to delete user-sent messages.)</i>"
+
+    # Confirm user exists in DB
+    with db() as conn:
+        u = conn.execute(
+            "SELECT user_id, first_name FROM users WHERE user_id=?",
+            (target_id,)
+        ).fetchone()
+
+    if not u:
+        await update.message.reply_html(
+            f"⚠️ User <code>{target_id}</code> not found in DB.\n\n"
+            f"Use <code>/find</code> to search by name."
+        )
+        return
+
+    name = u["first_name"] or f"ID {target_id}"
+    progress = await update.message.reply_html(
+        f"🔄 Resetting <b>{name}</b> (<code>{target_id}</code>)…"
     )
+
+    try:
+        await full_reset(context, target_id)
+        await progress.edit_text(
+            f"✅ <b>Reset complete</b> for {name} "
+            f"(<code>{target_id}</code>).\n\n"
+            f"All messages deleted, all DB state cleared.\n"
+            f"User can /start fresh.",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.error(f"cmd_reset failed for {target_id}: {e}")
+        await progress.edit_text(
+            f"❌ Reset failed for <code>{target_id}</code>: {e}",
+            parse_mode=ParseMode.HTML,
+        )
 
 async def cmd_wipeall(update, context):
     """Admin: /wipeall — wipe bot chats for ALL users (preserves purchases).
@@ -3754,19 +3783,20 @@ async def cmd_wipeall(update, context):
 
 
 async def cmd_resetall(update, context):
-    """Admin: /resetall — FULL nuclear reset for ALL users.
-    Deletes all bot messages AND all purchase records. Use only for testing
-    or starting fresh. Requires double confirmation."""
+    """Admin: /resetall DELETE-EVERYTHING — nuclear reset for ALL users."""
     if update.effective_user.id != ADMIN_ID:
         return
+
     args = context.args or []
     confirm = args and args[0].upper() == "DELETE-EVERYTHING"
 
     with db() as conn:
         user_count = conn.execute(
-            "SELECT COUNT(*) c FROM users").fetchone()["c"]
+            "SELECT COUNT(*) c FROM users"
+        ).fetchone()["c"]
         purchase_count = conn.execute(
-            "SELECT COUNT(*) c FROM purchases").fetchone()["c"]
+            "SELECT COUNT(*) c FROM purchases"
+        ).fetchone()["c"]
 
     if not confirm:
         await update.message.reply_html(
@@ -3775,26 +3805,53 @@ async def cmd_resetall(update, context):
             f"• Bot messages for <b>{user_count}</b> users\n"
             f"• <b>{purchase_count}</b> purchase records (incl. approved)\n\n"
             f"<b>Users will lose their access. They'll have to pay again.</b>\n\n"
-            f"To confirm, send: <code>/resetall DELETE-EVERYTHING</code>"
+            f"To confirm: <code>/resetall DELETE-EVERYTHING</code>"
         )
         return
 
-    await update.message.reply_text(
-        f"☢️ Resetting everything for {user_count} users…"
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM users"
+        ).fetchall()
+    user_ids = [r["user_id"] for r in rows]
+
+    progress = await update.message.reply_html(
+        f"☢️ Resetting <b>{len(user_ids)}</b> users…\n"
+        f"<i>This may take a while.</i>"
     )
 
-    with db() as conn:
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
-
-    for r in rows:
+    success = 0
+    failed = 0
+    for i, user_id in enumerate(user_ids):
         try:
-            await full_reset(context, r["user_id"])
+            await full_reset(context, user_id)
+            success += 1
         except Exception as e:
-            log.error(f"resetall failed for {r['user_id']}: {e}")
+            log.error(f"resetall failed for {user_id}: {e}")
+            failed += 1
 
-    await update.message.reply_html(
-        f"☢️ <b>All users reset.</b>\n"
-        f"All purchases deleted. DB is now clean."
+        # Update progress every 10 users
+        if (i + 1) % 10 == 0:
+            try:
+                await progress.edit_text(
+                    f"☢️ Resetting… {i + 1}/{len(user_ids)}\n"
+                    f"✅ {success} done | ❌ {failed} failed",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+        # Small delay every 5 users to avoid Telegram rate limits
+        if (i + 1) % 5 == 0:
+            import asyncio
+            await asyncio.sleep(0.5)
+
+    await progress.edit_text(
+        f"☢️ <b>Reset complete.</b>\n\n"
+        f"✅ Success : {success}\n"
+        f"❌ Failed  : {failed}\n\n"
+        f"All purchases deleted. DB is now clean.",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -5304,7 +5361,7 @@ async def cmd_away(update, context):
 async def cmd_fallback_toggle(update, context):
     """Admin: /fallback_toggle <on|off> — enable/disable fallback bundle offers
     
-    When enabled: Unpaid users see "📦 See Fallback Offers" button
+    When enabled: Unpaid users see "🎁 See Fallback Offers" button
     When disabled: Unpaid users see only primary offer (no fallback bundles)
     
     Examples:
