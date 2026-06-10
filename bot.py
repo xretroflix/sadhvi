@@ -79,24 +79,48 @@ for i in range(1, 11):
         _ENV_CHANNELS.append(c)
 
 def get_channels() -> list:
-    """Live channel list from DB. Falls back to env vars if DB is empty."""
+    """Live channel list from DB. Falls back to env vars if DB is empty.
+    Queries base columns first, then optional columns separately so a
+    missing migration column never breaks the whole channel list."""
     try:
         with db() as conn:
+            # Step 1 — safe base columns always present
             rows = conn.execute("""
-                SELECT id, name, price, link, position,
-                       group_label, separator_after
+                SELECT id, name, price, link, position
                 FROM channels
                 WHERE is_active=1
                 ORDER BY position ASC, id ASC
             """).fetchall()
+
+        if not rows:
+            log.warning("No channels in DB — falling back to env var channels.")
+            return _ENV_CHANNELS
+
         result = [dict(r) for r in rows]
-        if result:
-            return result
-        # DB empty — fall back to env vars so bot stays functional
-        log.warning("No channels in DB — falling back to env var channels.")
-        return _ENV_CHANNELS
+
+        # Step 2 — optional columns added by migration; safe to fail
+        try:
+            with db() as conn:
+                extra_rows = conn.execute("""
+                    SELECT id, group_label, separator_after
+                    FROM channels
+                    WHERE is_active=1
+                    ORDER BY position ASC, id ASC
+                """).fetchall()
+            extra_map = {r["id"]: dict(r) for r in extra_rows}
+            for c in result:
+                ex = extra_map.get(c["id"], {})
+                c["group_label"] = ex.get("group_label") or ""
+                c["separator_after"] = int(ex.get("separator_after") or 0)
+        except sqlite3.OperationalError:
+            # Columns not yet migrated — set safe defaults
+            for c in result:
+                c["group_label"] = ""
+                c["separator_after"] = 0
+
+        return result
+
     except sqlite3.OperationalError:
-        # Table doesn't exist yet — fall back to env vars
         log.warning("Channels table missing — falling back to env var channels.")
         return _ENV_CHANNELS
 
@@ -1501,11 +1525,23 @@ async def cmd_channel_list(update, context):
         )
         return
 
+    # Fetch optional columns separately — safe if migration hasn't run
+    extra_map = {}
+    try:
+        with db() as conn:
+            extras = conn.execute(
+                "SELECT id, group_label, separator_after FROM channels"
+            ).fetchall()
+        extra_map = {r["id"]: dict(r) for r in extras}
+    except sqlite3.OperationalError:
+        pass
+
     text = f"📺 <b>All Channels ({len(rows)})</b>\n\n"
     for r in rows:
         status = "✅" if r["is_active"] else "🚫"
-        group = r["group_label"] or "—"
-        sep = "on" if r["separator_after"] else "off"
+        ex = extra_map.get(r["id"], {})
+        group = ex.get("group_label") or "—"
+        sep = "on" if ex.get("separator_after") else "off"
         text += (
             f"{status} <b>ID {r['id']}</b> — {r['name']}\n"
             f"   💰 ₹{r['price']} | 📌 pos {r['position']}\n"
@@ -1688,50 +1724,60 @@ def build_channel_buttons(owned_channel_ids: set,
                           is_paid: bool,
                           unpaid_mode: bool = False) -> list:
     """Build channel button rows from DB — always reads fresh position,
-    group_label and separator_after. Access tied to channel_id, not position."""
+    group_label and separator_after. Access tied to channel_id, not position.
+    Uses int() cast throughout to prevent type-mismatch ownership failures."""
     channels = get_channels()  # fresh from DB, sorted by position
     tier_gate = is_tier_gate_enabled()
+
+    # Normalise owned set to integers — prevents str/int mismatch
+    owned_int = {int(x) for x in owned_channel_ids if x is not None}
+
     rows = []
 
     for idx, c in enumerate(channels):
+        c_id = int(c["id"])
+
         # Group label — non-tappable section header above this channel
-        label = c.get("group_label") or ""
-        if label.strip():
+        label = (c.get("group_label") or "").strip()
+        if label:
             rows.append([InlineKeyboardButton(
-                f"── {label.strip()} ──",
+                f"── {label} ──",
                 callback_data="noop"
             )])
 
         if unpaid_mode:
             if tier_gate:
-                # Only show the first channel as entry point
+                # Tier gate on — only first channel is the entry point
                 if idx == 0:
                     rows.append([InlineKeyboardButton(
                         f"⭐ {c['name']} — ₹{c['price']}",
-                        callback_data=f"buy:{c['id']}",
+                        callback_data=f"buy:{c_id}",
                     )])
-                # Still render separator even for hidden channels
+                # Hidden channels still get their separator below
             else:
-                # Tier gate off — all channels purchasable
+                # Tier gate off — every channel purchasable directly
                 rows.append([InlineKeyboardButton(
                     f"⭐ {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
+                    callback_data=f"buy:{c_id}",
                 )])
         else:
-            # Paid flow — owned=✅ direct link, unowned=🔒 buy
-            if c["id"] in owned_channel_ids:
+            # Paid flow — owned → ✅ direct link, unowned → 🔒 buy
+            if c_id in owned_int:
                 rows.append([InlineKeyboardButton(
                     f"✅ {c['name']}", url=c["link"]
                 )])
             else:
                 rows.append([InlineKeyboardButton(
                     f"🔒 {c['name']} — ₹{c['price']}",
-                    callback_data=f"buy:{c['id']}",
+                    callback_data=f"buy:{c_id}",
                 )])
 
         # Separator after this channel
-        sep = c.get("separator_after")
-        if sep and int(sep) == 1:
+        try:
+            sep = int(c.get("separator_after") or 0)
+        except (ValueError, TypeError):
+            sep = 0
+        if sep == 1:
             rows.append([InlineKeyboardButton(
                 "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
                 callback_data="noop"
