@@ -2354,7 +2354,37 @@ async def cb_buy(update, context):
     if not channel:
         return
 
+    # Hard ownership guard — catches stale buttons on old messages.
+    # If user already owns this channel, never show QR regardless of
+    # which message/button they tapped.
+    owned_check = get_owned_channel_ids(user.id)
+    if cid in owned_check:
+        await q.answer(
+            "✅ You already own this! Tap the green ✅ button to join.",
+            show_alert=True
+        )
+        # Refresh the menu so stale buy: buttons become ✅ url buttons
+        fresh_rows = build_channel_buttons(
+            owned_channel_ids=owned_check,
+            is_paid=True,
+            unpaid_mode=False,
+        )
+        # Try to update whichever message the user tapped
+        try:
+            await q.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(fresh_rows)
+            )
+        except Exception as e:
+            log.debug(f"owned channel menu refresh failed: {e}")
+            # If that message can't be edited (e.g. it's old), send a
+            # fresh /start menu instead
+            await cmd_start(update, context)
+        return
+
     # Already owned — answer with popup only, no extra button needed.
+    # (kept for belt-and-suspenders; the block above covers this)
+    if cid in owned_check:
+        return
     # build_channel_buttons gives owned channels a url= button so cb_buy
     # should rarely fire for owned channels — but handle it gracefully.
     if cid in get_owned_channel_ids(user.id):
@@ -6784,15 +6814,16 @@ async def cmd_resetme(update, context):
     )
 
 async def cmd_wipe(update, context):
-    """Admin: /wipe <user_id> — alias for /reset, same full nuclear reset."""
+    """Admin: /wipe <user_id> — delete bot messages only. Purchases preserved.
+    Use /reset to also delete purchase records (nuclear)."""
     if update.effective_user.id != ADMIN_ID:
         return
     args = context.args or []
     if not args:
-        await update.message.reply_text(
-            "Usage: <code>/wipe &lt;user_id&gt;</code> "
-            "(same as /reset — full clean)",
-            parse_mode=ParseMode.HTML,
+        await update.message.reply_html(
+            "Usage: <code>/wipe &lt;user_id&gt;</code>\n\n"
+            "Deletes bot messages only — purchases are preserved.\n"
+            "Use <code>/reset &lt;user_id&gt;</code> for full nuclear reset."
         )
         return
     try:
@@ -6800,9 +6831,43 @@ async def cmd_wipe(update, context):
     except ValueError:
         await update.message.reply_text("⚠️ Invalid user_id. Must be a number.")
         return
-    await full_reset(context, target_id)
+
+    # Gather ALL known bot message IDs
+    all_ids = set()
+    all_ids.update(get_tracked_msgs(target_id))
+    with db() as conn:
+        u = conn.execute(
+            "SELECT menu_msg_id FROM users WHERE user_id=?", (target_id,)
+        ).fetchone()
+        if u and u["menu_msg_id"]:
+            all_ids.add(u["menu_msg_id"])
+        purchases = conn.execute(
+            "SELECT main_msg_id FROM purchases WHERE user_id=?", (target_id,)
+        ).fetchall()
+        for p in purchases:
+            if p["main_msg_id"]:
+                all_ids.add(p["main_msg_id"])
+
+    deleted = 0
+    for mid in all_ids:
+        try:
+            await context.bot.delete_message(chat_id=target_id, message_id=mid)
+            deleted += 1
+        except Exception as e:
+            log.debug(f"wipe delete {mid} failed: {e}")
+
+    # Reset message refs ONLY — purchases untouched
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' WHERE user_id=?",
+            (target_id,))
+        conn.execute(
+            "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
+            (target_id,))
+
     await update.message.reply_html(
-        f"🧹 Wiped user <code>{target_id}</code> completely."
+        f"🧹 Wiped <b>{deleted}</b> messages for user <code>{target_id}</code>.\n"
+        f"✅ Purchase records preserved — user's access is intact."
     )
 
 # ==================================================================
