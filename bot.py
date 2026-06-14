@@ -336,7 +336,10 @@ def init_db():
             conn.execute("ALTER TABLE purchases ADD COLUMN qr_code_id INTEGER")
         except sqlite3.OperationalError:
             pass
-        
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN session_gen INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         
 
     seed_channels_from_env()
@@ -867,6 +870,11 @@ async def auto_wipe_user_chat(context):
     Approved purchases stay so the user is still recognized as a paid customer
     when they come back. They'll see ✅ on /start for what they already own."""
     user_id = context.job.data["user_id"]
+    expected_gen = context.job.data.get("session_gen")
+    # If a newer /start has run since this job was scheduled, abort.
+    if expected_gen is not None and get_session_gen(user_id) != expected_gen:
+        log.info(f"auto_wipe_user_chat: stale job for user {user_id}, skipping.")
+        return
     log.info(f"Auto-wiping chat (msgs only) for user {user_id}")
     # Gather ALL known bot message IDs (tracked + menu_msg_id + main_msg_id)
     all_ids = set()
@@ -949,16 +957,22 @@ def schedule_auto_wipe(context, user_id, minutes):
     """Schedule auto-wipe of user's bot chat after `minutes`."""
     if minutes <= 0:
         return
+    gen = get_session_gen(user_id)
     context.job_queue.run_once(
         auto_wipe_user_chat,
         when=timedelta(minutes=minutes),
-        data={"user_id": user_id},
+        data={"user_id": user_id, "session_gen": gen},
         name=f"autowipe_{user_id}",
     )
 
 async def inactivity_wipe(context):
     """JobQueue callback: user went idle mid-flow — wipe their chat entirely."""
     user_id = context.job.data["user_id"]
+    expected_gen = context.job.data.get("session_gen")
+    # If a newer /start has run since this job was scheduled, abort.
+    if expected_gen is not None and get_session_gen(user_id) != expected_gen:
+        log.info(f"inactivity_wipe: stale job for user {user_id}, skipping.")
+        return
     p = get_active_purchase(user_id)
 
     # If user has a purchase stuck in mid-flow, cancel it cleanly
@@ -1004,8 +1018,6 @@ async def inactivity_wipe(context):
 
 
 def reset_inactivity_timer(context, user_id):
-    """Cancel existing inactivity job and restart fresh.
-    Call this at the start of every user-facing handler."""
     if INACTIVITY_MINUTES <= 0:
         return
 
@@ -1015,11 +1027,12 @@ def reset_inactivity_timer(context, user_id):
     for job in context.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
 
-    # Schedule fresh timer
+    gen = get_session_gen(user_id)
+    # Schedule fresh timer carrying current generation
     context.job_queue.run_once(
         inactivity_wipe,
         when=timedelta(minutes=INACTIVITY_MINUTES),
-        data={"user_id": user_id},
+        data={"user_id": user_id, "session_gen": gen},
         name=job_name,
     )
 
@@ -1028,6 +1041,47 @@ def cancel_inactivity_timer(context, user_id):
     """Cancel inactivity timer — call when flow completes (approved/rejected)."""
     for job in context.job_queue.get_jobs_by_name(f"inactivity_{user_id}"):
         job.schedule_removal()
+
+def get_session_gen(user_id: int) -> int:
+    """Get current session generation counter for a user."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT session_gen FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return int(r["session_gen"] or 0) if r else 0
+
+def bump_session_gen(user_id: int) -> int:
+    """Increment session generation counter. Returns new value.
+    Called at the top of cmd_start to invalidate all prior scheduled jobs."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET session_gen = COALESCE(session_gen, 0) + 1 WHERE user_id=?",
+            (user_id,)
+        )
+        r = conn.execute(
+            "SELECT session_gen FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return int(r["session_gen"] or 0) if r else 0
+
+def cancel_all_user_jobs(context, user_id: int):
+    """Cancel every scheduled job for a user — inactivity, auto-wipe,
+    animations, QR expiry, reconfirm jobs. Call at top of cmd_start."""
+    prefixes = [
+        f"inactivity_{user_id}",
+        f"autowipe_{user_id}",
+    ]
+    # Cancel named jobs by prefix
+    for job in context.job_queue.jobs():
+        name = job.name or ""
+        if any(name.startswith(p) for p in prefixes):
+            job.schedule_removal()
+        # Cancel animation and reconfirm jobs for this user
+        if (f"anim_{user_id}_" in name
+                or f"reconfirm_approve_" in name
+                or f"reconfirm_reject_" in name
+                or f"qr_expire_{user_id}_" in name
+                or f"expmsg_del_{user_id}_" in name):
+            job.schedule_removal()
 
 
 def reset_user_data(user_id: int):
@@ -1965,6 +2019,14 @@ async def cmd_start(update, context):
         return
 
     upsert_user(user)
+
+    # ── Session guard ──────────────────────────────────────────────
+    # Cancel ALL pending jobs from any prior /start before doing anything.
+    # bump_session_gen increments the counter so any already-queued job
+    # (auto_wipe, inactivity, animations) sees a stale generation and
+    # self-cancels when it fires, even if schedule_removal races.
+    cancel_all_user_jobs(context, user.id)
+    bump_session_gen(user.id)
     reset_inactivity_timer(context, user.id)
 
     # NOTE: Do NOT delete the user's /start message — Telegram interprets
@@ -6933,140 +6995,316 @@ async def cmd_import_csv(update, context):
         "<i>File will be parsed and imported into database</i>"
     )
 
+async def cmd_check_imports(update, context):
+    """Admin: /check_imports — show purchase rows with bad channel_id."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    with db() as conn:
+        bad = conn.execute("""
+            SELECT id, user_id, channel_name, channel_id, status
+            FROM purchases
+            WHERE channel_id <= 0
+            ORDER BY id DESC LIMIT 30
+        """).fetchall()
+        total_approved = conn.execute(
+            "SELECT COUNT(*) c FROM purchases WHERE status='approved'"
+        ).fetchone()["c"]
+        good = conn.execute(
+            "SELECT COUNT(*) c FROM purchases "
+            "WHERE status='approved' AND channel_id > 0"
+        ).fetchone()["c"]
+
+    if not bad:
+        await update.message.reply_html(
+            f"✅ No bad rows found.\n"
+            f"Approved purchases with valid channel_id: <b>{good}</b>"
+        )
+        return
+
+    text = (
+        f"⚠️ <b>Purchases with bad channel_id ({len(bad)} rows)</b>\n"
+        f"Approved total: {total_approved} | Valid: {good}\n\n"
+    )
+    for r in bad:
+        text += (
+            f"• #{r['id']} user <code>{r['user_id']}</code> "
+            f"ch_id={r['channel_id']} "
+            f"name=<code>{r['channel_name']}</code> "
+            f"status={r['status']}\n"
+        )
+    text += (
+        f"\n<b>Fix:</b> Re-upload CSV with caption <code>overwrite</code>\n"
+        f"or run <code>/channel_list</code> to check name mismatches."
+    )
+    await update.message.reply_html(text)
+
 
 async def on_csv_import_file(update, context):
     """Handle CSV file upload for import."""
     user = update.effective_user
-    
+
     if user.id != ADMIN_ID:
         return
-    
+
     doc = update.message.document
     if not doc or not doc.file_name.endswith('.csv'):
         await update.message.reply_text("❌ Please upload a CSV file (.csv)")
         return
-    
+
     try:
-        # Download file
         file = await context.bot.get_file(doc.file_id)
         file_bytes = await file.download_as_bytearray()
         file_content = file_bytes.decode('utf-8-sig')
-        
-        # Parse CSV
+
         csv_reader = csv.DictReader(io.StringIO(file_content))
         rows = list(csv_reader)
-        
+
         if not rows:
             await update.message.reply_text("❌ CSV file is empty!")
             return
-        
-        # Check if overwrite mode requested
-        # Admin sends file caption as "overwrite" to update existing records
+
+        # Report detected columns so admin can verify format
+        detected_cols = csv_reader.fieldnames or []
+        await update.message.reply_html(
+            f"📋 <b>CSV detected</b>\n"
+            f"Rows: <b>{len(rows)}</b>\n"
+            f"Columns: <code>{', '.join(detected_cols)}</code>\n\n"
+            f"Processing…"
+        )
+
         caption = update.message.caption or ""
         overwrite_mode = caption.strip().lower() == "overwrite"
 
-        # Import records
+        # Build channel name → id map from DB (live, not CHANNELS proxy)
+        # Also build a case-insensitive fallback map
+        with db() as conn:
+            ch_rows = conn.execute(
+                "SELECT id, name FROM channels"
+            ).fetchall()
+        channel_name_map = {r["name"]: r["id"] for r in ch_rows}
+        channel_name_map_lower = {
+            r["name"].lower().strip(): r["id"] for r in ch_rows
+        }
+
         imported = 0
         updated = 0
         skipped = 0
+        unresolved_channels = []
         errors = []
 
         with db() as conn:
-            for row in rows:
+            for row_num, row in enumerate(rows, start=2):  # row 1 = header
                 try:
-                    purchase_id = int(row.get('PurchaseID', 0))
-                    created_at = row.get('CreatedAt', '')
-                    user_id = int(row.get('UserID', 0))
-                    name = row.get('Name', '')
-                    username = row.get('Username', '')
-                    channel_name = row.get('Channel', '')
-                    amount = int(row.get('Amount', 0))
-                    qr = row.get('QR', '')
-                    upi_name = row.get('UPIName', '')
-                    status = row.get('Status', 'pending')
-                    approved_at = row.get('ApprovedAt', None) or None
-                    rejected_at = row.get('RejectedAt', None) or None
+                    # ── Parse fields ──────────────────────────────────────
+                    raw_pid      = str(row.get('PurchaseID', '') or '').strip()
+                    created_at   = str(row.get('CreatedAt', '') or '').strip()
+                    raw_uid      = str(row.get('UserID', '') or '').strip()
+                    first_name   = str(row.get('Name', '') or '').strip().split()[0] \
+                                   if str(row.get('Name', '') or '').strip() else 'User'
+                    full_name    = str(row.get('Name', '') or '').strip()
+                    username     = str(row.get('Username', '') or '').strip()
+                    channel_name = str(row.get('Channel', '') or '').strip()
+                    raw_amount   = str(row.get('Amount', '') or '').strip()
+                    upi_name     = str(row.get('UPIName', '') or '').strip()
+                    status       = str(row.get('Status', 'approved') or 'approved').strip().lower()
+                    approved_at  = str(row.get('ApprovedAt', '') or '').strip() or None
+                    rejected_at  = str(row.get('RejectedAt', '') or '').strip() or None
 
-                    if not user_id or not channel_name or not amount:
+                    # ── Validate required fields ──────────────────────────
+                    if not raw_uid:
                         skipped += 1
+                        errors.append(f"Row {row_num}: missing UserID")
+                        continue
+                    if not channel_name:
+                        skipped += 1
+                        errors.append(f"Row {row_num}: missing Channel")
+                        continue
+                    if not raw_amount:
+                        skipped += 1
+                        errors.append(f"Row {row_num}: missing Amount")
                         continue
 
-                    # Check if record already exists
-                    existing = conn.execute(
-                        "SELECT id FROM purchases WHERE id=?",
-                        (purchase_id,)
-                    ).fetchone()
+                    user_id = int(raw_uid)
+                    amount  = int(raw_amount)
+                    purchase_id = int(raw_pid) if raw_pid else None
 
-                    # Determine channel_id from channel name
-                    channel_id = None
-                    for c in CHANNELS:
-                        if c['name'] == channel_name:
-                            channel_id = c['id']
-                            break
+                    # ── Resolve channel_id — THIS is the critical step ────
+                    # Exact match first, then case-insensitive strip
+                    channel_id = channel_name_map.get(channel_name)
+                    if channel_id is None:
+                        channel_id = channel_name_map_lower.get(
+                            channel_name.lower().strip()
+                        )
+                    if channel_id is None:
+                        # Try partial match (channel name contains CSV value)
+                        for db_name, db_id in channel_name_map.items():
+                            if (channel_name.lower() in db_name.lower()
+                                    or db_name.lower() in channel_name.lower()):
+                                channel_id = db_id
+                                break
+
+                    if channel_id is None:
+                        # Still unresolved — record it but still import with
+                        # a placeholder so we don't lose the approval record.
+                        # Admin will see the warning and can fix channel names.
+                        unresolved_channels.append(
+                            f"Row {row_num}: '{channel_name}' "
+                            f"(user {user_id})"
+                        )
+                        # Use -1 as sentinel for "channel name unknown"
+                        # This prevents collision with bundle sentinel (0)
+                        # and still lets ownership check work if admin
+                        # later re-imports with correct names.
+                        channel_id = -1
+
+                    # ── Upsert user record ────────────────────────────────
+                    # Always upsert so name/username stay current
+                    name_parts = full_name.split(None, 1)
+                    fn = name_parts[0] if name_parts else 'User'
+                    ln = name_parts[1] if len(name_parts) > 1 else ''
+                    conn.execute("""
+                        INSERT INTO users (user_id, first_name, last_name, username)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            first_name = COALESCE(excluded.first_name, first_name),
+                            last_name  = COALESCE(excluded.last_name,  last_name),
+                            username   = COALESCE(excluded.username,   username)
+                    """, (user_id, fn, ln, username or None))
+
+                    # ── Insert or update purchase ─────────────────────────
+                    if purchase_id:
+                        existing = conn.execute(
+                            "SELECT id, channel_id, status FROM purchases WHERE id=?",
+                            (purchase_id,)
+                        ).fetchone()
+                    else:
+                        # No PurchaseID in CSV — check by user+channel+status
+                        existing = conn.execute("""
+                            SELECT id, channel_id, status FROM purchases
+                            WHERE user_id=? AND channel_id=? AND status=?
+                            ORDER BY id DESC LIMIT 1
+                        """, (user_id, channel_id, status)).fetchone()
 
                     if existing:
                         if overwrite_mode:
-                            # Update existing record with new data
                             conn.execute("""
                                 UPDATE purchases SET
-                                    channel_name=?, amount=?, upi_name=?,
-                                    status=?, approved_at=?, rejected_at=?
-                                WHERE id=?
-                            """, (channel_name, amount, upi_name,
-                                  status, approved_at, rejected_at,
-                                  purchase_id))
+                                    channel_id   = ?,
+                                    channel_name = ?,
+                                    amount       = ?,
+                                    upi_name     = ?,
+                                    status       = ?,
+                                    approved_at  = ?,
+                                    rejected_at  = ?
+                                WHERE id = ?
+                            """, (channel_id, channel_name, amount,
+                                  upi_name or None, status,
+                                  approved_at, rejected_at,
+                                  existing["id"]))
                             updated += 1
                         else:
                             skipped += 1
-                        continue
-
-                    # Insert new record
-                    conn.execute("""
-                        INSERT INTO purchases
-                        (id, user_id, channel_id, channel_name, amount, qr_used,
-                         upi_name, status, created_at, approved_at, rejected_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (purchase_id, user_id, channel_id or 0, channel_name,
-                          amount, qr, upi_name, status, created_at,
-                          approved_at, rejected_at))
-
-                    # Ensure user exists
-                    conn.execute("""
-                        INSERT OR IGNORE INTO users (user_id, first_name, username)
-                        VALUES (?, ?, ?)
-                    """, (user_id, name.split()[0] if name else "User", username))
-
-                    imported += 1
+                    else:
+                        if purchase_id:
+                            conn.execute("""
+                                INSERT INTO purchases
+                                    (id, user_id, channel_id, channel_name,
+                                     amount, upi_name, status,
+                                     created_at, approved_at, rejected_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (purchase_id, user_id, channel_id,
+                                  channel_name, amount, upi_name or None,
+                                  status, created_at or None,
+                                  approved_at, rejected_at))
+                        else:
+                            conn.execute("""
+                                INSERT INTO purchases
+                                    (user_id, channel_id, channel_name,
+                                     amount, upi_name, status,
+                                     created_at, approved_at, rejected_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (user_id, channel_id, channel_name,
+                                  amount, upi_name or None, status,
+                                  created_at or None,
+                                  approved_at, rejected_at))
+                        imported += 1
 
                 except Exception as e:
-                    errors.append(f"Row {row.get('PurchaseID', '?')}: {str(e)}")
+                    errors.append(f"Row {row_num}: {e}")
                     continue
 
-            conn.commit()
+        # ── Re-map any channel_id=-1 rows if channel names now resolve ────
+        # (Handles case where channels table was empty during import but
+        #  gets populated later — running /import_csv again fixes them.)
+        remapped = 0
+        if unresolved_channels:
+            with db() as conn:
+                bad_rows = conn.execute("""
+                    SELECT id, channel_name FROM purchases WHERE channel_id=-1
+                """).fetchall()
+                for br in bad_rows:
+                    cid = channel_name_map.get(br["channel_name"])
+                    if cid is None:
+                        cid = channel_name_map_lower.get(
+                            br["channel_name"].lower().strip()
+                        )
+                    if cid is not None:
+                        conn.execute(
+                            "UPDATE purchases SET channel_id=? WHERE id=?",
+                            (cid, br["id"])
+                        )
+                        remapped += 1
 
-        # Send summary
+        # ── Build summary ─────────────────────────────────────────────────
         mode_label = "overwrite" if overwrite_mode else "append"
         summary = (
             f"✅ <b>CSV Import Complete</b> <i>({mode_label} mode)</i>\n\n"
             f"📊 <b>Results:</b>\n"
-            f"✅ Inserted : {imported} new records\n"
-            f"♻️ Updated  : {updated} existing records\n"
-            f"⏭️ Skipped  : {skipped} duplicates\n"
+            f"✅ Inserted  : {imported} new records\n"
+            f"♻️ Updated   : {updated} existing records\n"
+            f"🔁 Re-mapped : {remapped} channel_id fixes\n"
+            f"⏭️ Skipped   : {skipped} duplicates / bad rows\n"
         )
+
+        if unresolved_channels:
+            summary += (
+                f"\n⚠️ <b>Unresolved channel names ({len(unresolved_channels)}):</b>\n"
+                f"These rows were imported with channel_id=-1 and will NOT "
+                f"show ✅ buttons until fixed.\n\n"
+            )
+            for uc in unresolved_channels[:10]:
+                summary += f"  • {uc}\n"
+            if len(unresolved_channels) > 10:
+                summary += f"  … and {len(unresolved_channels) - 10} more\n"
+            summary += (
+                f"\n<b>Fix:</b> Ensure channel names in your CSV exactly match "
+                f"what's in /channel_list, then re-upload with caption "
+                f"<code>overwrite</code>."
+            )
+
         if errors:
-            summary += f"\n❌ Errors: {len(errors)}\n"
+            summary += f"\n❌ <b>Row errors ({len(errors)}):</b>\n"
             for err in errors[:5]:
                 summary += f"  • {err}\n"
             if len(errors) > 5:
-                summary += f"  ... and {len(errors) - 5} more"
+                summary += f"  … and {len(errors) - 5} more\n"
+
+        # Show DB channel names so admin can compare against CSV
+        summary += f"\n\n<b>Channel names in DB (for reference):</b>\n"
+        for db_name in channel_name_map:
+            summary += f"  • <code>{db_name}</code>\n"
 
         await update.message.reply_html(summary)
-        
-        # Notify in logs
-        log.info(f"CSV Import: {imported} imported, {skipped} skipped, {len(errors)} errors")
-        
+        log.info(
+            f"CSV Import: {imported} imported, {updated} updated, "
+            f"{skipped} skipped, {len(unresolved_channels)} unresolved channels, "
+            f"{len(errors)} errors"
+        )
+
     except Exception as e:
-        await update.message.reply_html(f"❌ Error processing CSV:\n<code>{str(e)}</code>")
+        await update.message.reply_html(
+            f"❌ Error processing CSV:\n<code>{e}</code>"
+        )
         log.error(f"CSV import error: {e}")
 
 
@@ -7337,6 +7575,7 @@ def main():
     app.add_handler(CommandHandler("qr_remove",   cmd_qr_remove))
     app.add_handler(CommandHandler("qr_restore",  cmd_qr_restore))
     app.add_handler(CommandHandler("qr_stats",    cmd_qr_stats))
+    app.add_handler(CommandHandler("check_imports", cmd_check_imports))
 
 
     jq = app.job_queue
