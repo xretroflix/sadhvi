@@ -2057,8 +2057,8 @@ async def cmd_start(update, context):
 
         maint_msg = get_maintenance_message()
         return_line = (
-            f"\n\n🕐 <b>{maint_msg}</b>" if maint_msg
-            else "\n\nPlease check back later."
+            f"🕐 <b>{maint_msg}</b>" if maint_msg
+            else "🕐 Please check back later."
         )
 
         # Check if this user has any approved purchases
@@ -2085,8 +2085,9 @@ async def cmd_start(update, context):
             # New / unpaid user — maintenance message only, no buttons
             text = (
                 f"🔧 <b>Under Maintenance</b>\n\n"
-                f"Hi {user.first_name}! Our service is temporarily "
-                f"unavailable while we make improvements.{return_line}"
+                f"Hi {user.first_name}!\n\n"
+                f"Our service is temporarily unavailable.\n\n"
+                f"{return_line}"
             )
             try:
                 m = await context.bot.send_message(
@@ -5186,6 +5187,191 @@ async def cmd_channel_separator(update, context):
         f"<i>Visible in menu on next /start.</i>"
     )
 
+async def _pin_msg_expire(context):
+    """JobQueue callback: delete a pinned message after its duration."""
+    data = context.job.data
+    chat_id    = data["chat_id"]
+    message_id = data["message_id"]
+    try:
+        await context.bot.delete_message(
+            chat_id=chat_id, message_id=message_id
+        )
+        log.debug(f"pin_msg expired: chat={chat_id} msg={message_id}")
+    except Exception as e:
+        log.debug(f"pin_msg expire delete failed: {e}")
+
+async def cmd_pin_msg(update, context):
+    """Admin: /pin_msg <duration_hours|forever> <segment> <message>
+
+    Send a persistent message to users that stays until manually wiped
+    or expires after the configured duration.
+
+    Duration:
+      forever     — never auto-deletes
+      24          — deletes after 24 hours
+      48          — deletes after 48 hours
+      0.5         — deletes after 30 minutes (decimals supported)
+
+    Segment:
+      all         — every user
+      unpaid      — no approved purchases
+      T1          — Tier 1 owners
+      T1,T2       — Tier 1 or Tier 2 owners
+
+    Examples:
+    /pin_msg forever all 🎉 New channels added! Tap /start to see them.
+    /pin_msg 24 unpaid 🔥 Special offer ends tonight — tap /start now!
+    /pin_msg 48 T1 ⭐ Upgrade available — tap /start to unlock Tier 2.
+    /pin_msg 0.5 all 🔧 Maintenance in 30 minutes. Please save your access links.
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = update.message.text.split(maxsplit=3)
+    # args[0] = /pin_msg
+
+    if len(args) < 4:
+        await update.message.reply_html(
+            "Usage: <code>/pin_msg &lt;duration|forever&gt; &lt;segment&gt; &lt;message&gt;</code>\n\n"
+            "<b>Duration:</b> hours (e.g. 24, 48, 0.5) or <code>forever</code>\n"
+            "<b>Segments:</b> all, unpaid, T1, T1,T2 etc.\n\n"
+            "Examples:\n"
+            "<code>/pin_msg forever all 🎉 New channels added!</code>\n"
+            "<code>/pin_msg 24 unpaid 🔥 Offer ends tonight!</code>\n"
+            "<code>/pin_msg 48 T1 ⭐ Upgrade now available.</code>"
+        )
+        return
+
+    duration_raw = args[1].strip().lower()
+    segment      = args[2].strip().lower()
+    message_text = args[3].strip()
+
+    # Parse duration
+    is_forever = duration_raw == "forever"
+    duration_hours = 0.0
+    if not is_forever:
+        try:
+            duration_hours = float(duration_raw)
+            if duration_hours <= 0:
+                await update.message.reply_text(
+                    "⚠️ Duration must be positive, or use 'forever'."
+                )
+                return
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Invalid duration. Use a number (hours) or 'forever'."
+            )
+            return
+
+    # Build target user list
+    with db() as conn:
+        all_users = conn.execute("SELECT user_id FROM users").fetchall()
+        purchases = conn.execute(
+            "SELECT user_id, channel_id FROM purchases WHERE status='approved'"
+        ).fetchall()
+        blocked_ids = {
+            r["user_id"] for r in
+            conn.execute("SELECT user_id FROM blocked_users").fetchall()
+        }
+
+    tier_map = {}
+    for p in purchases:
+        uid = p["user_id"]
+        if uid not in tier_map:
+            tier_map[uid] = set()
+        tier_map[uid].add(p["channel_id"])
+
+   # Check if segment is a numeric user ID
+    if segment.lstrip("-").isdigit():
+        single_uid = int(segment)
+        with db() as conn:
+            u = conn.execute(
+                "SELECT user_id FROM users WHERE user_id=?",
+                (single_uid,)
+            ).fetchone()
+        if not u:
+            await update.message.reply_html(
+                f"⚠️ User <code>{single_uid}</code> not found in DB.\n"
+                f"Use <code>/find</code> to search by name."
+            )
+            return
+        target_ids = [single_uid]
+    elif segment == "all":
+        target_ids = [u["user_id"] for u in all_users]
+    elif segment == "unpaid":
+        target_ids = [u["user_id"] for u in all_users
+                      if u["user_id"] not in tier_map]
+    else:
+        try:
+            required_tiers = {
+                int(t.replace("T", "").replace("t", ""))
+                for t in segment.split(",")
+            }
+            target_ids = [
+                u["user_id"] for u in all_users
+                if any(t in tier_map.get(u["user_id"], set())
+                       for t in required_tiers)
+            ]
+        except ValueError:
+            await update.message.reply_text("⚠️ Invalid segment format.")
+            return
+
+    target_ids = [uid for uid in target_ids if uid not in blocked_ids]
+
+    if not target_ids:
+        await update.message.reply_html(
+            f"No eligible users in segment <b>{segment}</b>."
+        )
+        return
+
+    duration_label = "forever" if is_forever else f"{duration_hours}h"
+    await update.message.reply_html(
+        f"📌 Sending pinned message to <b>{len(target_ids)}</b> users "
+        f"(segment: <b>{segment}</b>, expires: <b>{duration_label}</b>)…"
+    )
+
+    full_text = f"📌 <b>Notice</b>\n\n{message_text}"
+
+    sent = 0
+    failed = 0
+    sent_message_ids = {}  # {user_id: message_id}
+
+    for uid in target_ids:
+        try:
+            m = await context.bot.send_message(
+                chat_id=uid,
+                text=full_text,
+                parse_mode=ParseMode.HTML,
+                disable_notification=False,  # notify — this is intentional
+            )
+            track_msg(uid, m.message_id)
+            sent_message_ids[uid] = m.message_id
+            sent += 1
+        except Exception as e:
+            log.debug(f"pin_msg to {uid} failed: {e}")
+            failed += 1
+
+    # Schedule auto-delete job for each message if not forever
+    if not is_forever:
+        delay_seconds = duration_hours * 3600
+        for uid, mid in sent_message_ids.items():
+            context.job_queue.run_once(
+                _pin_msg_expire,
+                when=delay_seconds,
+                data={"chat_id": uid, "message_id": mid},
+                name=f"pinmsg_{uid}_{mid}",
+            )
+
+    await update.message.reply_html(
+        f"✅ <b>Pinned message sent.</b>\n"
+        f"Segment  : <b>{segment}</b>\n"
+        f"Sent     : {sent}\n"
+        f"Failed   : {failed}\n"
+        f"Expires  : <b>{duration_label}</b>\n\n"
+        f"<i>Messages are tracked — they will be wiped automatically "
+        f"on /wipe, /reset, or user's next /start.</i>"
+    ) 
+
 _HELP_DETAILS = {
     "stats":     ("<b>/stats</b>\n\nOverall bot totals.\n\n"
                   "Shows total users, approved revenue, and purchase count per status "
@@ -7754,6 +7940,7 @@ def main():
     app.add_handler(CommandHandler("qr_restore",  cmd_qr_restore))
     app.add_handler(CommandHandler("qr_stats",    cmd_qr_stats))
     app.add_handler(CommandHandler("check_imports", cmd_check_imports))
+    app.add_handler(CommandHandler("pin_msg", cmd_pin_msg))
 
 
     jq = app.job_queue
