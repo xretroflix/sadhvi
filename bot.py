@@ -1199,6 +1199,54 @@ async def cmd_proof_mode(update, context):
         f"<i>Takes effect immediately on next payment.</i>"
     )
 
+def cancel_all_user_jobs(context, user_id: int):
+    """Cancel every scheduled job tied to a user.
+    Called at the very top of cmd_start so no prior-session job
+    can fire and corrupt the new session."""
+    uid = str(user_id)
+    for job in context.job_queue.jobs():
+        name = job.name or ""
+        if (
+            # Exact-prefix jobs
+            name.startswith(f"inactivity_{uid}")
+            or name.startswith(f"autowipe_{uid}")
+            or name.startswith(f"maint_del_{uid}")
+            or name.startswith(f"pinmsg_{uid}")
+            or name.startswith(f"expmsg_del_{uid}")
+            or name.startswith(f"qr_expire_{uid}")
+            # Pattern jobs that embed user_id anywhere
+            or f"_anim_{uid}_"   in f"_{name}"
+            or f"_anim_{uid}_"   in f"_{name}_"
+            or name.startswith(f"anim_{uid}_")
+            or f"reconfirm_approve_" in name
+            or f"reconfirm_reject_"  in name
+        ):
+            job.schedule_removal()
+            log.debug(f"cancel_all_user_jobs: removed job '{name}' for user {uid}")
+
+async def _maintenance_msg_expire(context):
+    """JobQueue callback: delete maintenance message after 5 minutes.
+    Checks session_gen — if user triggered a new /start, the wipe
+    already happened so this job exits cleanly without double-deleting."""
+    data = context.job.data
+    user_id    = data["chat_id"]
+    message_id = data["message_id"]
+    expected_gen = data.get("session_gen")
+
+    if expected_gen is not None and get_session_gen(user_id) != expected_gen:
+        log.debug(
+            f"_maintenance_msg_expire: stale for user {user_id}, skipping."
+        )
+        return
+
+    try:
+        await context.bot.delete_message(
+            chat_id=user_id, message_id=message_id
+        )
+        log.debug(f"maintenance msg expired for user {user_id}")
+    except Exception as e:
+        log.debug(f"_maintenance_msg_expire delete failed: {e}")
+
 async def cmd_sleep(update, context):
     """Admin: /sleep <on|off|status> [return message]
 
@@ -2048,10 +2096,42 @@ async def cmd_start(update, context):
     if is_blocked(user.id):
         return
 
-    # Sleep mode — record visitor silently, send no response
+    upsert_user(user)
+
+    # ── Session guard — runs for ALL users including sleep mode ────
+    # Must run before sleep check so stale jobs from prior /start
+    # are always cancelled regardless of bot state.
+    cancel_all_user_jobs(context, user.id)
+    bump_session_gen(user.id)
+
+    # ── Wipe ALL prior messages before doing anything ──────────────
+    # This ensures no stale menu/maintenance/approval messages linger
+    # regardless of which flow runs next.
+    _prior_ids = set(get_tracked_msgs(user.id))
+    with db() as conn:
+        _u = conn.execute(
+            "SELECT menu_msg_id FROM users WHERE user_id=?", (user.id,)
+        ).fetchone()
+        if _u and _u["menu_msg_id"]:
+            _prior_ids.add(_u["menu_msg_id"])
+        _pmsgs = conn.execute(
+            "SELECT main_msg_id FROM purchases WHERE user_id=?", (user.id,)
+        ).fetchall()
+        for _pm in _pmsgs:
+            if _pm["main_msg_id"]:
+                _prior_ids.add(_pm["main_msg_id"])
+    for _mid in _prior_ids:
+        await safe_delete(context, user.id, _mid)
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' WHERE user_id=?",
+            (user.id,))
+        conn.execute(
+            "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
+            (user.id,))
+
     # Sleep / maintenance mode
     if is_sleep_mode() and user.id != ADMIN_ID:
-        upsert_user(user)
         log_sleep_visitor(user)
         log.info(f"Sleep mode: recorded visitor {user.id}")
 
@@ -2061,7 +2141,6 @@ async def cmd_start(update, context):
             else "🕐 Please check back later."
         )
 
-        # Check if this user has any approved purchases
         with db() as conn:
             owned_purchases = conn.execute(
                 "SELECT DISTINCT channel_id, amount FROM purchases "
@@ -2099,17 +2178,20 @@ async def cmd_start(update, context):
                 track_msg(user.id, m.message_id)
                 gen = get_session_gen(user.id)
                 context.job_queue.run_once(
-                    auto_delete_message,
+                    _maintenance_msg_expire,
                     when=300,
-                    data={"chat_id": user.id, "message_id": m.message_id,
-                          "session_gen": gen},
+                    data={
+                        "chat_id": user.id,
+                        "message_id": m.message_id,
+                        "session_gen": gen,
+                    },
                     name=f"maint_del_{user.id}_{m.message_id}",
                 )
             except Exception as e:
                 log.debug(f"maintenance msg send failed: {e}")
             return
 
-        # Paid user — show only their purchased channels, no buy buttons
+        # Paid user — show only purchased channels
         kb_rows = []
         for c in get_channels():
             if c["id"] in owned_channel_ids:
@@ -2125,57 +2207,29 @@ async def cmd_start(update, context):
 
         text = (
             f"🔧 <b>Maintenance Mode</b>\n\n"
-            f"Hi {user.first_name}! The bot is under maintenance right now.\n"
-            f"You can still access your purchased channels below.{return_line}"
+            f"Hi {user.first_name}! The bot is under maintenance.\n"
+            f"You can still access your purchased channels below.\n\n"
+            f"{return_line}"
         )
         try:
-            # Try editing existing menu message first
+            m = await context.bot.send_message(
+                chat_id=user.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
+                protect_content=True,
+                disable_notification=True,
+            )
+            track_msg(user.id, m.message_id)
             with db() as conn:
-                user_row = conn.execute(
-                    "SELECT menu_msg_id FROM users WHERE user_id=?",
-                    (user.id,)
-                ).fetchone()
-            edited = False
-            if user_row and user_row["menu_msg_id"]:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=user.id,
-                        message_id=user_row["menu_msg_id"],
-                        text=text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
-                    )
-                    edited = True
-                except Exception:
-                    pass
-            if not edited:
-                m = await context.bot.send_message(
-                    chat_id=user.id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
-                    protect_content=True,
-                    disable_notification=True,
+                conn.execute(
+                    "UPDATE users SET menu_msg_id=? WHERE user_id=?",
+                    (m.message_id, user.id)
                 )
-                track_msg(user.id, m.message_id)
-                with db() as conn:
-                    conn.execute(
-                        "UPDATE users SET menu_msg_id=? WHERE user_id=?",
-                        (m.message_id, user.id)
-                    )
         except Exception as e:
             log.debug(f"maintenance paid msg failed: {e}")
         return
 
-    upsert_user(user)
-
-    # ── Session guard ──────────────────────────────────────────────
-    # Cancel ALL pending jobs from any prior /start before doing anything.
-    # bump_session_gen increments the counter so any already-queued job
-    # (auto_wipe, inactivity, animations) sees a stale generation and
-    # self-cancels when it fires, even if schedule_removal races.
-    cancel_all_user_jobs(context, user.id)
-    bump_session_gen(user.id)
     reset_inactivity_timer(context, user.id)
 
     # NOTE: Do NOT delete the user's /start message — Telegram interprets
