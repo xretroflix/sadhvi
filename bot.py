@@ -1065,17 +1065,17 @@ def bump_session_gen(user_id: int) -> int:
 
 def cancel_all_user_jobs(context, user_id: int):
     """Cancel every scheduled job for a user — inactivity, auto-wipe,
-    animations, QR expiry, reconfirm jobs. Call at top of cmd_start."""
+    animations, QR expiry, reconfirm jobs, maintenance msgs.
+    Call at top of cmd_start."""
     prefixes = [
         f"inactivity_{user_id}",
         f"autowipe_{user_id}",
+        f"maint_del_{user_id}",
     ]
-    # Cancel named jobs by prefix
     for job in context.job_queue.jobs():
         name = job.name or ""
         if any(name.startswith(p) for p in prefixes):
             job.schedule_removal()
-        # Cancel animation and reconfirm jobs for this user
         if (f"anim_{user_id}_" in name
                 or f"reconfirm_approve_" in name
                 or f"reconfirm_reject_" in name
@@ -2095,11 +2095,13 @@ async def cmd_start(update, context):
                     parse_mode=ParseMode.HTML,
                     disable_notification=True,
                 )
-                # Auto-delete after 5 minutes so chat stays clean
+                track_msg(user.id, m.message_id)
+                gen = get_session_gen(user.id)
                 context.job_queue.run_once(
                     auto_delete_message,
                     when=300,
-                    data={"chat_id": user.id, "message_id": m.message_id},
+                    data={"chat_id": user.id, "message_id": m.message_id,
+                          "session_gen": gen},
                     name=f"maint_del_{user.id}_{m.message_id}",
                 )
             except Exception as e:
@@ -2154,6 +2156,7 @@ async def cmd_start(update, context):
                     protect_content=True,
                     disable_notification=True,
                 )
+                track_msg(user.id, m.message_id)
                 with db() as conn:
                     conn.execute(
                         "UPDATE users SET menu_msg_id=? WHERE user_id=?",
