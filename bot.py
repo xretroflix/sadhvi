@@ -1224,28 +1224,39 @@ def cancel_all_user_jobs(context, user_id: int):
             job.schedule_removal()
             log.debug(f"cancel_all_user_jobs: removed job '{name}' for user {uid}")
 
+async def send_and_autodelete(context, chat_id, text,
+                               delay=300, **kwargs):
+    """Send a message and schedule it for auto-deletion after `delay` seconds.
+    Default delay is 300 seconds (5 minutes).
+    Returns the sent message object."""
+    m = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        **kwargs
+    )
+    track_msg(chat_id, m.message_id)
+    context.job_queue.run_once(
+        _maintenance_msg_expire,
+        when=delay,
+        data={"chat_id": chat_id, "message_id": m.message_id},
+        name=f"maint_del_{chat_id}_{m.message_id}",
+    )
+    return m
+
 async def _maintenance_msg_expire(context):
     """JobQueue callback: delete maintenance message after 5 minutes.
-    Checks session_gen — if user triggered a new /start, the wipe
-    already happened so this job exits cleanly without double-deleting."""
+    Always deletes unconditionally — if /start already wiped it,
+    the delete will just silently fail which is fine."""
     data = context.job.data
     user_id    = data["chat_id"]
     message_id = data["message_id"]
-    expected_gen = data.get("session_gen")
-
-    if expected_gen is not None and get_session_gen(user_id) != expected_gen:
-        log.debug(
-            f"_maintenance_msg_expire: stale for user {user_id}, skipping."
-        )
-        return
-
     try:
         await context.bot.delete_message(
             chat_id=user_id, message_id=message_id
         )
         log.debug(f"maintenance msg expired for user {user_id}")
     except Exception as e:
-        log.debug(f"_maintenance_msg_expire delete failed: {e}")
+        log.debug(f"_maintenance_msg_expire delete failed (already gone): {e}")
 
 async def cmd_sleep(update, context):
     """Admin: /sleep <on|off|status> [return message]
@@ -2169,23 +2180,11 @@ async def cmd_start(update, context):
                 f"{return_line}"
             )
             try:
-                m = await context.bot.send_message(
-                    chat_id=user.id,
-                    text=text,
+                m = await send_and_autodelete(
+                    context, user.id, text,
+                    delay=300,
                     parse_mode=ParseMode.HTML,
                     disable_notification=True,
-                )
-                track_msg(user.id, m.message_id)
-                gen = get_session_gen(user.id)
-                context.job_queue.run_once(
-                    _maintenance_msg_expire,
-                    when=300,
-                    data={
-                        "chat_id": user.id,
-                        "message_id": m.message_id,
-                        "session_gen": gen,
-                    },
-                    name=f"maint_del_{user.id}_{m.message_id}",
                 )
             except Exception as e:
                 log.debug(f"maintenance msg send failed: {e}")
@@ -2212,15 +2211,14 @@ async def cmd_start(update, context):
             f"{return_line}"
         )
         try:
-            m = await context.bot.send_message(
-                chat_id=user.id,
-                text=text,
+            m = await send_and_autodelete(
+                context, user.id, text,
+                delay=300,
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
                 protect_content=True,
                 disable_notification=True,
             )
-            track_msg(user.id, m.message_id)
             with db() as conn:
                 conn.execute(
                     "UPDATE users SET menu_msg_id=? WHERE user_id=?",
