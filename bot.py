@@ -1200,17 +1200,29 @@ async def cmd_proof_mode(update, context):
     )
 
 async def cmd_sleep(update, context):
-    """Admin: /sleep <on|off|status>"""
+    """Admin: /sleep <on|off|status> [return message]
+
+    on  → Sleep mode ON. Paid users see only their channels.
+          New users see maintenance message.
+    off → Bot wakes up normally.
+
+    Optional return-time message appended after 'on':
+    /sleep on Back in 3 hours
+    /sleep on Returns at 9:00 PM IST
+    /sleep on Maintenance until Sunday 9 AM IST
+    """
     if update.effective_user.id != ADMIN_ID:
         return
 
     args = context.args or []
     if not args:
         await update.message.reply_html(
-            "Usage: <code>/sleep &lt;on|off|status&gt;</code>\n\n"
-            "<code>/sleep on</code>     — Bot goes silent, records visitors\n"
-            "<code>/sleep off</code>    — Bot wakes up\n"
-            "<code>/sleep status</code> — Current state + visitor count\n\n"
+            "Usage: <code>/sleep &lt;on|off|status&gt; [return message]</code>\n\n"
+            "<code>/sleep on</code> — Enable maintenance mode\n"
+            "<code>/sleep on Back in 3 hours</code> — With return time\n"
+            "<code>/sleep on Returns at 9:00 PM IST</code> — Exact time\n"
+            "<code>/sleep off</code> — Wake bot up\n"
+            "<code>/sleep status</code> — Current state\n\n"
             "Use <code>/sleep_visitors</code> to see who visited while asleep."
         )
         return
@@ -1219,13 +1231,15 @@ async def cmd_sleep(update, context):
 
     if action == "status":
         enabled = is_sleep_mode()
+        maint_msg = get_maintenance_message()
         with db() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) c FROM sleep_visitors"
             ).fetchone()["c"]
-        status = "😴 SLEEPING" if enabled else "✅ AWAKE"
+        status = "😴 SLEEPING (maintenance)" if enabled else "✅ AWAKE"
         await update.message.reply_html(
             f"<b>Bot Status:</b> {status}\n"
+            f"<b>Return message:</b> {maint_msg or '(none set)'}\n"
             f"<b>Visitors recorded:</b> {count}\n\n"
             f"<i>Use /sleep_visitors to see the full list.</i>"
         )
@@ -1239,22 +1253,30 @@ async def cmd_sleep(update, context):
     set_admin_setting("sleep_mode", "true" if enabled else "false")
 
     if enabled:
+        # Optional return-time message: everything after "on"
+        return_msg = " ".join(args[1:]).strip() if len(args) > 1 else ""
+        set_maintenance_message(return_msg)
+
+        preview = return_msg or "(no return time set — users will just see maintenance notice)"
         await update.message.reply_html(
-            "😴 <b>Sleep mode ON</b>\n\n"
-            "Bot is now silent. All /start visitors are recorded.\n"
-            "Use <code>/sleep_visitors</code> to see who visited.\n"
-            "Use <code>/sleep off</code> to wake up."
+            "😴 <b>Maintenance mode ON</b>\n\n"
+            f"<b>Return message:</b> {preview}\n\n"
+            "• Paid users → see only their purchased channels\n"
+            "• New/unpaid users → see maintenance message\n"
+            "• No QR codes or purchase buttons shown\n\n"
+            "Use <code>/sleep off</code> to wake up.\n"
+            "Use <code>/sleep_visitors</code> to see who visited."
         )
     else:
+        set_maintenance_message("")
         with db() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) c FROM sleep_visitors"
             ).fetchone()["c"]
         await update.message.reply_html(
             f"✅ <b>Bot is now AWAKE</b>\n\n"
-            f"Recorded <b>{count}</b> visitors while asleep.\n"
-            f"Use <code>/sleep_visitors</code> to see them.\n"
-            f"Use <code>/sleep_visitors clear</code> to reset the list."
+            f"Recorded <b>{count}</b> visitors while in maintenance.\n"
+            f"Use <code>/sleep_visitors</code> to see them."
         )
 
 
@@ -1682,6 +1704,21 @@ def is_sleep_mode() -> bool:
         ).fetchone()
     return r["value"].lower() == "true" if r else False
 
+def get_maintenance_message() -> str:
+    """Get admin-configured maintenance return time message."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM admin_settings WHERE key='maintenance_message'"
+        ).fetchone()
+    return r["value"] if r else ""
+
+def set_maintenance_message(msg: str):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO admin_settings (key, value) VALUES ('maintenance_message', ?)",
+            (msg,)
+        )
+
 def log_sleep_visitor(user):
     """Record a user who visited during sleep mode."""
     with db() as conn:
@@ -2012,10 +2049,118 @@ async def cmd_start(update, context):
         return
 
     # Sleep mode — record visitor silently, send no response
+    # Sleep / maintenance mode
     if is_sleep_mode() and user.id != ADMIN_ID:
         upsert_user(user)
         log_sleep_visitor(user)
         log.info(f"Sleep mode: recorded visitor {user.id}")
+
+        maint_msg = get_maintenance_message()
+        return_line = (
+            f"\n\n🕐 <b>{maint_msg}</b>" if maint_msg
+            else "\n\nPlease check back later."
+        )
+
+        # Check if this user has any approved purchases
+        with db() as conn:
+            owned_purchases = conn.execute(
+                "SELECT DISTINCT channel_id, amount FROM purchases "
+                "WHERE user_id=? AND status='approved'",
+                (user.id,)
+            ).fetchall()
+
+        owned_channel_ids = {
+            row["channel_id"] for row in owned_purchases
+            if row["channel_id"] and row["channel_id"] > 0
+        }
+        owned_bundle_prices = set()
+        for row in owned_purchases:
+            if row["channel_id"] == 0 and row["amount"]:
+                try:
+                    owned_bundle_prices.add(int(row["amount"]))
+                except (ValueError, TypeError):
+                    pass
+
+        if not owned_channel_ids and not owned_bundle_prices:
+            # New / unpaid user — maintenance message only, no buttons
+            text = (
+                f"🔧 <b>Under Maintenance</b>\n\n"
+                f"Hi {user.first_name}! Our service is temporarily "
+                f"unavailable while we make improvements.{return_line}"
+            )
+            try:
+                m = await context.bot.send_message(
+                    chat_id=user.id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    disable_notification=True,
+                )
+                # Auto-delete after 5 minutes so chat stays clean
+                context.job_queue.run_once(
+                    auto_delete_message,
+                    when=300,
+                    data={"chat_id": user.id, "message_id": m.message_id},
+                    name=f"maint_del_{user.id}_{m.message_id}",
+                )
+            except Exception as e:
+                log.debug(f"maintenance msg send failed: {e}")
+            return
+
+        # Paid user — show only their purchased channels, no buy buttons
+        kb_rows = []
+        for c in get_channels():
+            if c["id"] in owned_channel_ids:
+                kb_rows.append([InlineKeyboardButton(
+                    f"✅ {c['name']}", url=c["link"]
+                )])
+        for price in sorted(owned_bundle_prices):
+            if price in BUNDLES:
+                bundle = BUNDLES[price]
+                kb_rows.append([InlineKeyboardButton(
+                    f"✅ {bundle['name']}", url=bundle["link"]
+                )])
+
+        text = (
+            f"🔧 <b>Maintenance Mode</b>\n\n"
+            f"Hi {user.first_name}! The bot is under maintenance right now.\n"
+            f"You can still access your purchased channels below.{return_line}"
+        )
+        try:
+            # Try editing existing menu message first
+            with db() as conn:
+                user_row = conn.execute(
+                    "SELECT menu_msg_id FROM users WHERE user_id=?",
+                    (user.id,)
+                ).fetchone()
+            edited = False
+            if user_row and user_row["menu_msg_id"]:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user.id,
+                        message_id=user_row["menu_msg_id"],
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
+                    )
+                    edited = True
+                except Exception:
+                    pass
+            if not edited:
+                m = await context.bot.send_message(
+                    chat_id=user.id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
+                    protect_content=True,
+                    disable_notification=True,
+                )
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE users SET menu_msg_id=? WHERE user_id=?",
+                        (m.message_id, user.id)
+                    )
+        except Exception as e:
+            log.debug(f"maintenance paid msg failed: {e}")
         return
 
     upsert_user(user)
@@ -2242,6 +2387,16 @@ async def cb_fallback_menu(update, context):
     q = update.callback_query
     await q.answer()
     user = q.from_user
+
+    # Block during maintenance
+    if is_sleep_mode() and user.id != ADMIN_ID:
+        maint_msg = get_maintenance_message()
+        return_line = f" {maint_msg}" if maint_msg else ""
+        await q.answer(
+            f"🔧 Under maintenance.{return_line}",
+            show_alert=True
+        )
+        return
     
     if is_blocked(user.id):
         return
@@ -2273,6 +2428,16 @@ async def cb_buy_bundle(update, context):
     q = update.callback_query
     await q.answer()
     user = q.from_user
+
+    # Block during maintenance
+    if is_sleep_mode() and user.id != ADMIN_ID:
+        maint_msg = get_maintenance_message()
+        return_line = f" {maint_msg}" if maint_msg else ""
+        await q.answer(
+            f"🔧 Under maintenance.{return_line}",
+            show_alert=True
+        )
+        return
     
     if is_blocked(user.id):
         return
@@ -2411,6 +2576,16 @@ async def cb_buy(update, context):
     await q.answer()
     user = q.from_user
     cid = int(q.data.split(":")[1])
+
+    # Block purchases during maintenance
+    if is_sleep_mode() and user.id != ADMIN_ID:
+        maint_msg = get_maintenance_message()
+        return_line = f" {maint_msg}" if maint_msg else ""
+        await q.answer(
+            f"🔧 Under maintenance.{return_line}",
+            show_alert=True
+        )
+        return
 
     channel = next((c for c in CHANNELS if c["id"] == cid), None)
     if not channel:
