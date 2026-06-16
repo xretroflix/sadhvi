@@ -3202,8 +3202,36 @@ async def on_text_message(update, context):
     reset_inactivity_timer(context, user.id)
 
     if user.id not in AWAITING_UPI:
-        # User sent a free-text message mid-flow or after QR —
-        # forward it to admin so nothing gets missed
+        # Check if it's a greeting — reply with /start prompt
+        greetings = {
+            "hi", "hello", "hey", "hii", "helo", "heyy", "helloo",
+            "hai", "start", "begin", "help", "who are you", "what",
+            "sup", "yo", "ello", "good morning", "good evening",
+            "good afternoon", "gm", "ge", "ga", "bot", "?", "??",
+        }
+        msg_lower = update.message.text.strip().lower()
+        if msg_lower in greetings or len(msg_lower) <= 4:
+            try:
+                m = await context.bot.send_message(
+                    chat_id=user.id,
+                    text=(
+                        f"👋 <b>Hi {user.first_name}!</b>\n\n"
+                        f"Tap the button below to get started 👇"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "🚀 Start", callback_data="trigger_start"
+                        )
+                    ]]),
+                    disable_notification=True,
+                )
+                track_msg(user.id, m.message_id)
+            except Exception as e:
+                log.debug(f"greeting reply failed: {e}")
+            return
+
+        # Non-greeting free-text — forward to admin as before
         await forward_user_message_to_admin(update, context, user)
         return
 
@@ -5818,6 +5846,16 @@ async def cb_help_detail(update, context):
     except Exception as e:
         log.debug(f"cb_help_detail failed: {e}")
 
+async def cb_trigger_start(update, context):
+    """User tapped the Start button from greeting reply — trigger /start."""
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await cmd_start(update, context)
+
 
 async def cmd_logs(update, context):
     """Admin: /logs <user_id> — show all messages from a user."""
@@ -8107,6 +8145,7 @@ def main():
     app.add_handler(CommandHandler("qr_stats",    cmd_qr_stats))
     app.add_handler(CommandHandler("check_imports", cmd_check_imports))
     app.add_handler(CommandHandler("pin_msg", cmd_pin_msg))
+    app.add_handler(CallbackQueryHandler(cb_trigger_start, pattern=r"^trigger_start$"))
 
 
     jq = app.job_queue
