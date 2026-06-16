@@ -1875,39 +1875,100 @@ def pick_qr_code() -> dict | None:
 def build_channel_buttons(owned_channel_ids: set,
                           is_paid: bool,
                           unpaid_mode: bool = False) -> list:
-    """Build channel button rows from DB — always reads fresh position,
-    group_label and separator_after. Access tied to channel_id, not position.
-    Uses int() cast throughout to prevent type-mismatch ownership failures."""
-    channels = get_channels()  # fresh from DB, sorted by position
-    tier_gate = is_tier_gate_enabled()
+    """Build channel button rows from DB.
 
-    # Normalise owned set to integers — prevents str/int mismatch
+    Key rule for removed channels (is_active=0):
+      - Unpaid users  → never shown (hidden from purchase)
+      - Paid users    → shown as ✅ join button ONLY if they own it
+                        hidden entirely if they don't own it
+
+    Active channels follow normal rules:
+      - Unpaid        → ⭐ buy button (tier gate respected)
+      - Paid + owned  → ✅ join button
+      - Paid + unpaid → 🔒 buy button
+    """
+    # Active channels — for unpaid flow and unowned paid buttons
+    active_channels = get_channels()  # WHERE is_active=1, sorted by position
+
+    # All channels including removed — for owned detection in paid flow
+    with db() as conn:
+        all_channel_rows = conn.execute("""
+            SELECT id, name, price, link, is_active,
+                   position, group_label, separator_after
+            FROM channels
+            ORDER BY position ASC, id ASC
+        """).fetchall()
+    all_channels = [dict(r) for r in all_channel_rows]
+
+    tier_gate = is_tier_gate_enabled()
     owned_int = {int(x) for x in owned_channel_ids if x is not None}
 
     rows = []
 
-    for idx, c in enumerate(channels):
-        c_id = int(c["id"])
+    if unpaid_mode:
+        # Unpaid flow — only show active channels
+        for idx, c in enumerate(active_channels):
+            c_id = int(c["id"])
 
-        # Group label — non-tappable section header above this channel
-        label = (c.get("group_label") or "").strip()
-        if label:
-            rows.append([InlineKeyboardButton(
-                f"── {label} ──",
-                callback_data="noop"
-            )])
+            label = (c.get("group_label") or "").strip()
+            if label:
+                rows.append([InlineKeyboardButton(
+                    f"── {label} ──",
+                    callback_data="noop"
+                )])
 
-        if unpaid_mode:
             if tier_gate and idx > 0:
-                # Tier gate on — only show entry point (idx=0), skip rest
-                # Skip separator too — no orphaned dividers
+                # Tier gate on — only show first active channel
+                try:
+                    sep = int(c.get("separator_after") or 0)
+                except (ValueError, TypeError):
+                    sep = 0
+                if sep == 1:
+                    rows.append([InlineKeyboardButton(
+                        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+                        callback_data="noop"
+                    )])
                 continue
+
             rows.append([InlineKeyboardButton(
                 f"⭐ {c['name']} — ₹{c['price']}",
                 callback_data=f"buy:{c_id}",
             )])
-        else:
-            # Paid flow — owned → ✅ direct link, unowned → 🔒 buy
+
+            try:
+                sep = int(c.get("separator_after") or 0)
+            except (ValueError, TypeError):
+                sep = 0
+            if sep == 1:
+                rows.append([InlineKeyboardButton(
+                    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+                    callback_data="noop"
+                )])
+
+    else:
+        # Paid flow — iterate ALL channels so owned-but-removed ones appear
+        for c in all_channels:
+            c_id      = int(c["id"])
+            is_active = int(c.get("is_active") or 0)
+
+            # Removed channel — show ONLY if user owns it, skip otherwise
+            if not is_active:
+                if c_id in owned_int:
+                    rows.append([InlineKeyboardButton(
+                        f"✅ {c['name']}", url=c["link"]
+                    )])
+                # Either way no separator/label for removed channels —
+                # keeps the menu clean
+                continue
+
+            # Active channel — normal label/separator/button logic
+            label = (c.get("group_label") or "").strip()
+            if label:
+                rows.append([InlineKeyboardButton(
+                    f"── {label} ──",
+                    callback_data="noop"
+                )])
+
             if c_id in owned_int:
                 rows.append([InlineKeyboardButton(
                     f"✅ {c['name']}", url=c["link"]
@@ -1918,16 +1979,15 @@ def build_channel_buttons(owned_channel_ids: set,
                     callback_data=f"buy:{c_id}",
                 )])
 
-        # Separator after this channel
-        try:
-            sep = int(c.get("separator_after") or 0)
-        except (ValueError, TypeError):
-            sep = 0
-        if sep == 1:
-            rows.append([InlineKeyboardButton(
-                "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-                callback_data="noop"
-            )])
+            try:
+                sep = int(c.get("separator_after") or 0)
+            except (ValueError, TypeError):
+                sep = 0
+            if sep == 1:
+                rows.append([InlineKeyboardButton(
+                    "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+                    callback_data="noop"
+                )])
 
     return rows
     """Build channel button rows respecting position, group labels, separators.
@@ -2548,21 +2608,51 @@ async def cb_buy_bundle(update, context):
         f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
     )
 
-    if qr_source == "file_id":
-        qr_msg = await context.bot.send_photo(
-            chat_id=user.id, photo=qr_photo,
-            caption=caption, parse_mode=ParseMode.HTML,
-            reply_markup=kb,
+    import asyncio
+
+    async def _send_qr_with_retry(retries=3, delay=2):
+        for attempt in range(retries):
+            try:
+                if qr_source == "file_id":
+                    return await context.bot.send_photo(
+                        chat_id=user.id, photo=qr_photo,
+                        caption=caption, parse_mode=ParseMode.HTML,
+                        reply_markup=kb,
+                        disable_notification=True,
+                        read_timeout=30,
+                        write_timeout=30,
+                        connect_timeout=30,
+                    )
+                else:
+                    with open(qr_photo, "rb") as fh:
+                        return await context.bot.send_photo(
+                            chat_id=user.id, photo=fh,
+                            caption=caption, parse_mode=ParseMode.HTML,
+                            reply_markup=kb,
+                            disable_notification=True,
+                            read_timeout=30,
+                            write_timeout=30,
+                            connect_timeout=30,
+                        )
+            except Exception as e:
+                log.warning(
+                    f"send_photo attempt {attempt+1}/{retries} failed: {e}"
+                )
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        return None
+
+    qr_msg = await _send_qr_with_retry()
+    if not qr_msg:
+        m = await context.bot.send_message(
+            user.id,
+            "⚠️ Failed to send QR. Please tap /start and try again.",
             disable_notification=True,
         )
-    else:
-        with open(qr_photo, "rb") as fh:
-            qr_msg = await context.bot.send_photo(
-                chat_id=user.id, photo=fh,
-                caption=caption, parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                disable_notification=True,
-            )
+        track_msg(user.id, m.message_id)
+        return
 
     track_msg(user.id, qr_msg.message_id)
     update_purchase(pid, main_msg_id=qr_msg.message_id,
@@ -2778,21 +2868,51 @@ async def cb_buy(update, context):
         f"✅ <b>STEP 2</b> — After paying, tap the button below 👇"
     )
 
-    if qr_source == "file_id":
-        qr_msg = await context.bot.send_photo(
-            chat_id=user.id, photo=qr_photo,
-            caption=caption, parse_mode=ParseMode.HTML,
-            reply_markup=kb,
+    import asyncio
+
+    async def _send_qr_with_retry(retries=3, delay=2):
+        for attempt in range(retries):
+            try:
+                if qr_source == "file_id":
+                    return await context.bot.send_photo(
+                        chat_id=user.id, photo=qr_photo,
+                        caption=caption, parse_mode=ParseMode.HTML,
+                        reply_markup=kb,
+                        disable_notification=True,
+                        read_timeout=30,
+                        write_timeout=30,
+                        connect_timeout=30,
+                    )
+                else:
+                    with open(qr_photo, "rb") as fh:
+                        return await context.bot.send_photo(
+                            chat_id=user.id, photo=fh,
+                            caption=caption, parse_mode=ParseMode.HTML,
+                            reply_markup=kb,
+                            disable_notification=True,
+                            read_timeout=30,
+                            write_timeout=30,
+                            connect_timeout=30,
+                        )
+            except Exception as e:
+                log.warning(
+                    f"send_photo attempt {attempt+1}/{retries} failed: {e}"
+                )
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        return None
+
+    qr_msg = await _send_qr_with_retry()
+    if not qr_msg:
+        m = await context.bot.send_message(
+            user.id,
+            "⚠️ Failed to send QR. Please tap /start and try again.",
             disable_notification=True,
         )
-    else:
-        with open(qr_photo, "rb") as fh:
-            qr_msg = await context.bot.send_photo(
-                chat_id=user.id, photo=fh,
-                caption=caption, parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                disable_notification=True,
-            )
+        track_msg(user.id, m.message_id)
+        return
 
     track_msg(user.id, qr_msg.message_id)
     update_purchase(pid, main_msg_id=qr_msg.message_id,
@@ -3914,12 +4034,6 @@ async def cb_admin(update, context):
 
         schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
         await event_backup(context)
-
-        # Auto-wipe user chat after delay so it looks fresh next time
-        schedule_auto_wipe(context, user_id, AUTO_WIPE_MINUTES)
-
-        # Auto-backup DB right after rejection — captures the audit trail.
-        #await event_backup(context)
 
     elif action == "reqss":
         update_purchase(pid, status="screenshot_requested")
@@ -8019,10 +8133,14 @@ def main():
     log.info("Bot v3 starting…")
     # Tuned polling: timeout=10 keeps long-poll connection open for 10s,
     # giving Telegram instant push to deliver updates with minimal lag.
+    # Suppress httpx INFO logs — they print the full bot token URL
+    import logging as _logging
+    _logging.getLogger("httpx").setLevel(_logging.WARNING)
+
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        poll_interval=0.0,   # no artificial sleep between polls
-        timeout=10,          # long-poll: server holds connection until update arrives
+        poll_interval=0.0,
+        timeout=10,
         drop_pending_updates=False,
     )
 
