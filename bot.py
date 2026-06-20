@@ -175,25 +175,6 @@ logging.basicConfig(
 log = logging.getLogger("subbot")
 
 # ==================================================================
-# PHONEPE CONFIG
-# ==================================================================
-PHONEPE_CLIENT_ID      = os.getenv("PHONEPE_CLIENT_ID", "")
-PHONEPE_CLIENT_SECRET  = os.getenv("PHONEPE_CLIENT_SECRET", "")
-PHONEPE_CLIENT_VERSION = int(os.getenv("PHONEPE_CLIENT_VERSION", "1"))
-PHONEPE_WEBHOOK_NAME   = os.getenv("PHONEPE_WEBHOOK_NAME", "")
-PHONEPE_WEBHOOK_PASS   = os.getenv("PHONEPE_WEBHOOK_SECRET", "")
-PHONEPE_ENV            = os.getenv("PHONEPE_ENV", "PRODUCTION")  # or UAT
-
-# PhonePe API endpoints
-PHONEPE_AUTH_URL = "https://api.phonepe.com/apis/identity-manager/v1/oauth/token"
-PHONEPE_PAY_URL  = "https://api.phonepe.com/apis/pg/checkout/v2/pay"
-
-# Your publicly accessible webhook URL (must be HTTPS)
-# Set this in Railway env vars — e.g. https://yourapp.railway.app/phonepe/webhook
-PHONEPE_WEBHOOK_URL  = os.getenv("PHONEPE_WEBHOOK_URL", "")
-PHONEPE_REDIRECT_URL = os.getenv("PHONEPE_REDIRECT_URL", "https://t.me/YOUR_BOT_USERNAME")
-
-# ==================================================================
 # DATABASE
 # ==================================================================
 def db():
@@ -825,11 +806,13 @@ async def cmd_tier_gate(update, context):
     )
 
 async def clear_tracked(context, user_id):
-    """Delete all tracked bot messages concurrently."""
+    """Delete all tracked bot messages in user's chat."""
     ids = get_tracked_msgs(user_id)
-    if not ids:
-        return
-    await bulk_delete(context, user_id, ids)
+    for mid in ids:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=mid)
+        except Exception as e:
+            log.debug(f"delete msg {mid} failed: {e}")
     set_tracked_msgs(user_id, [])
 
 async def safe_delete(context, chat_id, msg_id):
@@ -837,18 +820,6 @@ async def safe_delete(context, chat_id, msg_id):
         await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
     except Exception as e:
         log.debug(f"safe_delete {msg_id} failed: {e}")
-
-async def bulk_delete(context, chat_id, message_ids: list):
-    """Delete multiple messages concurrently instead of sequentially.
-    Silently ignores already-deleted messages."""
-    if not message_ids:
-        return
-    import asyncio
-    await asyncio.gather(*[
-        context.bot.delete_message(chat_id=chat_id, message_id=mid)
-        for mid in message_ids
-        if mid
-    ], return_exceptions=True)
 
 async def edit_main(context, chat_id, msg_id, text, reply_markup=None):
     """Edit a tracked main message — works whether it's text or caption.
@@ -920,7 +891,11 @@ async def auto_wipe_user_chat(context):
         for p in purchases:
             if p["main_msg_id"]:
                 all_ids.add(p["main_msg_id"])
-    await bulk_delete(context, user_id, list(all_ids))
+    for mid in all_ids:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=mid)
+        except Exception as e:
+            log.debug(f"auto-wipe delete {mid} failed: {e}")
     # Reset menu/main refs so next /start sends fresh, but KEEP purchases
     with db() as conn:
         conn.execute(
@@ -2216,23 +2191,15 @@ async def cmd_start(update, context):
         for _pm in _pmsgs:
             if _pm["main_msg_id"]:
                 _prior_ids.add(_pm["main_msg_id"])
-    import asyncio
-    # Run message deletion and DB reset concurrently
-    async def _wipe_messages():
-        await bulk_delete(context, user.id, list(_prior_ids))
-
-    def _reset_db_refs():
-        with db() as conn:
-            conn.execute(
-                "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' "
-                "WHERE user_id=?", (user.id,))
-            conn.execute(
-                "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
-                (user.id,))
-
-    # Fire DB reset immediately (sync) then delete messages async
-    _reset_db_refs()
-    asyncio.ensure_future(_wipe_messages())
+    for _mid in _prior_ids:
+        await safe_delete(context, user.id, _mid)
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET menu_msg_id=NULL, tracked_msgs='[]' WHERE user_id=?",
+            (user.id,))
+        conn.execute(
+            "UPDATE purchases SET main_msg_id=NULL WHERE user_id=?",
+            (user.id,))
 
     # Sleep / maintenance mode
     if is_sleep_mode() and user.id != ADMIN_ID:
@@ -2693,9 +2660,11 @@ async def cb_buy_bundle(update, context):
 
     # DB updates after both messages are delivered
     track_msg(user.id, qr_msg.message_id)
-    update_purchase(pid, main_msg_id=qr_msg.message_id,
+    track_msg(user.id, pay_msg.message_id)
+    update_purchase(pid, main_msg_id=pay_msg.message_id,
                     qr_downloaded_at=datetime.utcnow().isoformat())
 
+    # Schedule QR expiry on the QR photo message
     if QR_EXPIRY_MINUTES > 0:
         context.job_queue.run_once(
             expire_qr,
@@ -2704,24 +2673,21 @@ async def cb_buy_bundle(update, context):
                   "qr_msg_id": qr_msg.message_id},
             name=f"qr_expire_{user.id}_{pid}",
         )
-
-    # Admin notify fires in background — doesn't block user flow
-    async def _notify_admin():
-        u_row = get_user_row(user.id)
-        p_row = get_purchase(pid)
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(f"📥 <b>QR Downloaded</b>\n\n"
-                      f"{fmt_user_block(u_row, p_row)}\n\n"
-                      f"⏳ Awaiting payment proof…"),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            log.error(f"Admin notify failed: {e}")
-
-    asyncio.ensure_future(_notify_admin())
+    
+    
+    # Notify admin
+    u_row = get_user_row(user.id)
+    p_row = get_purchase(pid)
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(f"📥 <b>QR Downloaded (Bundle)</b>\n\n{fmt_user_block(u_row, p_row)}\n\n"
+                  f"⏳ Awaiting payment proof…"),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.error(f"Admin notify failed: {e}")
 
 
 
@@ -2952,6 +2918,7 @@ async def cb_buy(update, context):
     update_purchase(pid, main_msg_id=qr_msg.message_id,
                     qr_downloaded_at=datetime.utcnow().isoformat())
 
+    # Schedule QR expiry on the QR photo message
     if QR_EXPIRY_MINUTES > 0:
         context.job_queue.run_once(
             expire_qr,
@@ -2961,23 +2928,19 @@ async def cb_buy(update, context):
             name=f"qr_expire_{user.id}_{pid}",
         )
 
-    # Admin notify fires in background — doesn't block user flow
-    async def _notify_admin():
-        u_row = get_user_row(user.id)
-        p_row = get_purchase(pid)
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(f"📥 <b>QR Downloaded</b>\n\n"
-                      f"{fmt_user_block(u_row, p_row)}\n\n"
-                      f"⏳ Awaiting payment proof…"),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            log.error(f"Admin notify failed: {e}")
-
-    asyncio.ensure_future(_notify_admin())
+    # Notify admin
+    u_row = get_user_row(user.id)
+    p_row = get_purchase(pid)
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(f"📥 <b>QR Downloaded</b>\n\n{fmt_user_block(u_row, p_row)}\n\n"
+                  f"⏳ Awaiting payment proof…"),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.error(f"Admin notify failed: {e}")
 
 async def send_upi_prompt(context):
     """Job: edit the QR document caption in-place to ADD the 'I've Paid' button.
@@ -3238,10 +3201,6 @@ async def on_text_message(update, context):
         return
     reset_inactivity_timer(context, user.id)
 
-    # Wipe greeting reply on any follow-up message
-    if user.id in GREETING_REPLY:
-        await safe_delete(context, user.id, GREETING_REPLY.pop(user.id))
-
     if user.id not in AWAITING_UPI:
         # Check if it's a greeting — reply with /start prompt
         greetings = {
@@ -3251,8 +3210,7 @@ async def on_text_message(update, context):
             "good afternoon", "gm", "ge", "ga", "bot", "?", "??",
         }
         msg_lower = update.message.text.strip().lower()
-        is_single_word = len(msg_lower.split()) == 1
-        if is_single_word and msg_lower in greetings:
+        if msg_lower in greetings or len(msg_lower) <= 4:
             try:
                 m = await context.bot.send_message(
                     chat_id=user.id,
@@ -3269,7 +3227,6 @@ async def on_text_message(update, context):
                     disable_notification=True,
                 )
                 track_msg(user.id, m.message_id)
-                GREETING_REPLY[user.id] = m.message_id
             except Exception as e:
                 log.debug(f"greeting reply failed: {e}")
             return
@@ -8222,12 +8179,8 @@ def main():
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         poll_interval=0.0,
-        timeout=30,          # longer long-poll = updates arrive faster
+        timeout=10,
         drop_pending_updates=False,
-        connect_timeout=15,
-        read_timeout=30,
-        write_timeout=30,
-        pool_timeout=30,
     )
 
 
