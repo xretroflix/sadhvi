@@ -2979,6 +2979,7 @@ async def send_upi_prompt(context):
 # USER: enter UPI name
 # ==================================================================
 AWAITING_UPI = {}
+LAST_GREETING_MSG = {}
 
 async def cb_upi_start(update, context):
     """User tapped 'I've Paid'. Delete the QR photo entirely (user is done
@@ -3211,6 +3212,20 @@ async def on_text_message(update, context):
         }
         msg_lower = update.message.text.strip().lower()
         if msg_lower in greetings or len(msg_lower) <= 4:
+            # Delete the user's own greeting message for cleanliness
+            await safe_delete(context, user.id, update.message.message_id)
+
+            # Delete previous greeting reply if one exists
+            prev_mid = LAST_GREETING_MSG.pop(user.id, None)
+            if prev_mid:
+                # Also cancel its 5-min auto-delete job — we're replacing it
+                for job in context.job_queue.jobs():
+                    jname = job.name or ""
+                    if jname == f"maint_del_{user.id}_{prev_mid}":
+                        job.schedule_removal()
+                        break
+                await safe_delete(context, user.id, prev_mid)
+
             try:
                 m = await context.bot.send_message(
                     chat_id=user.id,
@@ -3227,12 +3242,20 @@ async def on_text_message(update, context):
                     disable_notification=True,
                 )
                 track_msg(user.id, m.message_id)
+                LAST_GREETING_MSG[user.id] = m.message_id
+
+                # Schedule 5-min auto-delete for new greeting reply
+                context.job_queue.run_once(
+                    _maintenance_msg_expire,
+                    when=300,
+                    data={"chat_id": user.id, "message_id": m.message_id},
+                    name=f"maint_del_{user.id}_{m.message_id}",
+                )
             except Exception as e:
                 log.debug(f"greeting reply failed: {e}")
             return
 
-        # Non-greeting free-text — forward to admin as before
-        await forward_user_message_to_admin(update, context, user)
+        # Non-greeting — silently ignore, no admin forward
         return
 
     pid = AWAITING_UPI.pop(user.id)
@@ -5850,6 +5873,8 @@ async def cb_trigger_start(update, context):
     """User tapped the Start button from greeting reply — trigger /start."""
     q = update.callback_query
     await q.answer()
+    # Clear greeting tracking — user has moved to proper flow
+    LAST_GREETING_MSG.pop(q.from_user.id, None)
     try:
         await q.message.delete()
     except Exception:
