@@ -757,6 +757,27 @@ def is_tier_gate_enabled() -> bool:
         ).fetchone()
     return r["value"].lower() == "true" if r else True
 
+def is_preview_mode_enabled() -> bool:
+    """Check if channel preview mode is enabled."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM admin_settings WHERE key='preview_mode'"
+        ).fetchone()
+    return r["value"].lower() == "true" if r else False
+
+def get_preview_channel_ids() -> list:
+    """Get list of channel IDs shown to unpaid users in preview mode."""
+    with db() as conn:
+        r = conn.execute(
+            "SELECT value FROM admin_settings WHERE key='preview_channel_ids'"
+        ).fetchone()
+    if not r or not r["value"]:
+        return []
+    try:
+        return [int(x.strip()) for x in r["value"].split(",") if x.strip()]
+    except ValueError:
+        return []
+
 async def cmd_tier_gate(update, context):
     """Admin: /tier_gate <on|off|status>
 
@@ -803,6 +824,142 @@ async def cmd_tier_gate(update, context):
     await update.message.reply_html(
         f"<b>Tier Gate:</b> {status}\n\n"
         f"<i>Next /start will reflect this change for all users.</i>"
+    )
+
+async def cmd_preview_mode(update, context):
+    """Admin: /preview_mode <on|off|set|status>
+
+    Controls how many channels unpaid users see on /start.
+
+    on          → Enable preview mode (uses channels set with 'set')
+    off         → Disable preview mode (all channels shown as normal)
+    set 1,2,3   → Set which channel IDs to show unpaid users
+    status      → Show current configuration
+
+    After any approved purchase, user sees ALL channels regardless
+    of preview mode — this is NOT a tier gate.
+
+    Examples:
+    /preview_mode set 1,2        → unpaid users see only channels 1 and 2
+    /preview_mode set 1,2,3      → unpaid users see only channels 1, 2 and 3
+    /preview_mode on             → activate preview mode
+    /preview_mode off            → deactivate, show all channels to everyone
+    /preview_mode status         → check current state
+    """
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "Usage: <code>/preview_mode &lt;on|off|set|status&gt;</code>\n\n"
+            "<code>/preview_mode set 1,2</code>   — pick channels for unpaid users\n"
+            "<code>/preview_mode on</code>         — activate preview mode\n"
+            "<code>/preview_mode off</code>        — deactivate\n"
+            "<code>/preview_mode status</code>     — check current state\n\n"
+            "<i>After any purchase, user sees ALL channels automatically.</i>"
+        )
+        return
+
+    action = args[0].lower()
+
+    if action == "status":
+        enabled = is_preview_mode_enabled()
+        preview_ids = get_preview_channel_ids()
+        all_channels = get_channels()
+        id_to_name = {c["id"]: c["name"] for c in all_channels}
+
+        preview_names = (
+            ", ".join(
+                f"{cid} ({id_to_name.get(cid, '?')})"
+                for cid in preview_ids
+            ) if preview_ids else "(none set)"
+        )
+        status = "✅ ON" if enabled else "🚫 OFF"
+        await update.message.reply_html(
+            f"<b>Preview Mode:</b> {status}\n"
+            f"<b>Preview channels:</b> {preview_names}\n\n"
+            f"<i>Paid users always see all channels regardless of this setting.</i>"
+        )
+        return
+
+    if action == "set":
+        if len(args) < 2:
+            await update.message.reply_html(
+                "Usage: <code>/preview_mode set 1,2,3</code>\n\n"
+                "Use channel IDs from <code>/channel_list</code>"
+            )
+            return
+
+        raw_ids = args[1].strip()
+        try:
+            ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip()]
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Invalid format. Use comma-separated IDs: 1,2,3"
+            )
+            return
+
+        # Validate each ID exists
+        all_channels = get_channels()
+        valid_ids = {c["id"] for c in all_channels}
+        invalid = [i for i in ids if i not in valid_ids]
+        if invalid:
+            await update.message.reply_html(
+                f"⚠️ These channel IDs don't exist: "
+                f"<code>{', '.join(str(i) for i in invalid)}</code>\n\n"
+                f"Use <code>/channel_list</code> to see valid IDs."
+            )
+            return
+
+        set_admin_setting("preview_channel_ids", ",".join(str(i) for i in ids))
+
+        id_to_name = {c["id"]: c["name"] for c in all_channels}
+        names = ", ".join(
+            f"{i} ({id_to_name[i]})" for i in ids
+        )
+        await update.message.reply_html(
+            f"✅ <b>Preview channels set:</b> {names}\n\n"
+            f"Now run <code>/preview_mode on</code> to activate."
+        )
+        return
+
+    if action in ("on", "off"):
+        enabled = action == "on"
+
+        # Safety check — don't enable if no channels configured
+        if enabled and not get_preview_channel_ids():
+            await update.message.reply_html(
+                "⚠️ No preview channels set yet.\n\n"
+                "First run: <code>/preview_mode set 1,2</code>"
+            )
+            return
+
+        set_admin_setting("preview_mode", "true" if enabled else "false")
+
+        if enabled:
+            preview_ids = get_preview_channel_ids()
+            all_channels = get_channels()
+            id_to_name = {c["id"]: c["name"] for c in all_channels}
+            names = ", ".join(
+                f"{i} ({id_to_name.get(i, '?')})" for i in preview_ids
+            )
+            await update.message.reply_html(
+                f"✅ <b>Preview Mode ON</b>\n\n"
+                f"Unpaid users see: <b>{names}</b>\n"
+                f"After any purchase: all channels revealed.\n\n"
+                f"<i>Takes effect on next /start.</i>"
+            )
+        else:
+            await update.message.reply_html(
+                f"🚫 <b>Preview Mode OFF</b>\n\n"
+                f"All channels shown to everyone.\n\n"
+                f"<i>Takes effect on next /start.</i>"
+            )
+        return
+
+    await update.message.reply_text(
+        "Unknown action. Use: on, off, set, or status"
     )
 
 async def clear_tracked(context, user_id):
@@ -1906,9 +2063,26 @@ def build_channel_buttons(owned_channel_ids: set,
     rows = []
 
     if unpaid_mode:
-        # Unpaid flow — only show active channels
+        # Determine which channels to show to unpaid users
+        # Priority: tier_gate > preview_mode > show all
+        if tier_gate:
+            # Tier gate — only first channel visible
+            allowed_ids = (
+                {int(active_channels[0]["id"])} if active_channels else set()
+            )
+        elif is_preview_mode_enabled():
+            # Preview mode — only admin-selected channels visible
+            allowed_ids = set(get_preview_channel_ids())
+        else:
+            # No restriction — show all active channels
+            allowed_ids = {int(c["id"]) for c in active_channels}
+
         for idx, c in enumerate(active_channels):
             c_id = int(c["id"])
+
+            # Skip channels not in the allowed set
+            if c_id not in allowed_ids:
+                continue
 
             label = (c.get("group_label") or "").strip()
             if label:
@@ -1916,19 +2090,6 @@ def build_channel_buttons(owned_channel_ids: set,
                     f"── {label} ──",
                     callback_data="noop"
                 )])
-
-            if tier_gate and idx > 0:
-                # Tier gate on — only show first active channel
-                try:
-                    sep = int(c.get("separator_after") or 0)
-                except (ValueError, TypeError):
-                    sep = 0
-                if sep == 1:
-                    rows.append([InlineKeyboardButton(
-                        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-                        callback_data="noop"
-                    )])
-                continue
 
             rows.append([InlineKeyboardButton(
                 f"⭐ {c['name']} — ₹{c['price']}",
@@ -8171,6 +8332,7 @@ def main():
     app.add_handler(CommandHandler("check_imports", cmd_check_imports))
     app.add_handler(CommandHandler("pin_msg", cmd_pin_msg))
     app.add_handler(CallbackQueryHandler(cb_trigger_start, pattern=r"^trigger_start$"))
+    app.add_handler(CommandHandler("preview_mode", cmd_preview_mode))
 
 
     jq = app.job_queue
