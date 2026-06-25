@@ -5956,18 +5956,40 @@ _HELP_DETAILS = {
                           "<b>Examples:</b>\n"
                           "<code>/channel_separator 2 on</code>\n"
                           "<code>/channel_separator 2 off</code>"),
+    "check_imports": ("<b>/check_imports</b>\n\nShow purchase rows with bad or unresolved "
+                      "channel_id (0 or -1). Use after CSV import to verify all records "
+                      "mapped correctly.\n\n"
+                      "<b>Example:</b> <code>/check_imports</code>"),
+    "pin_msg":       ("<b>/pin_msg &lt;duration|forever&gt; &lt;segment|user_id&gt; &lt;message&gt;</b>\n\n"
+                      "Send a persistent message that auto-deletes after the set duration. "
+                      "Tracked by the wipe system — cleared on /wipe, /reset, or next /start.\n\n"
+                      "<b>Duration:</b> hours (24, 48, 0.5) or <code>forever</code>\n"
+                      "<b>Segment:</b> all, unpaid, T1, T1,T2 or a single user_id\n\n"
+                      "<b>Examples:</b>\n"
+                      "<code>/pin_msg forever all 🎉 New channels added!</code>\n"
+                      "<code>/pin_msg 24 unpaid 🔥 Offer ends tonight!</code>\n"
+                      "<code>/pin_msg 6 123456789 Message for one user</code>"),
+    "preview_mode":  ("<b>/preview_mode &lt;on|off|set|status&gt;</b>\n\n"
+                      "Limit which channels unpaid users see on /start. "
+                      "After any approved purchase, all channels are revealed automatically. "
+                      "Independent of tier gate.\n\n"
+                      "<code>/preview_mode set 1,2</code>  — pick channels for unpaid users\n"
+                      "<code>/preview_mode on</code>        — activate\n"
+                      "<code>/preview_mode off</code>       — deactivate\n"
+                      "<code>/preview_mode status</code>    — check current state\n\n"
+                      "<b>Example:</b> <code>/preview_mode set 1,2,3</code>"),
 }
 
 _HELP_SECTIONS = [
-    ("📊 Stats & Reports",      ["stats", "pending", "summary", "listusers", "find", "whoami", "unpaid"]),
-    ("📺 Channels", ["channel_list", "channel_add", "channel_edit", "channel_remove", "channel_restore", "channel_group", "channel_separator"]),
+    ("📊 Stats & Reports",      ["stats", "pending", "summary", "listusers", "find", "whoami", "unpaid", "check_imports"]),
+    ("📺 Channels",             ["channel_list", "channel_add", "channel_edit", "channel_remove", "channel_restore", "channel_group", "channel_separator"]),
     ("💳 QR Codes",             ["qr_list", "qr_mode", "qr_priority", "qr_active", "qr_remove", "qr_restore", "qr_stats"]),
     ("🧹 Cleanup (single)",     ["wipe", "reset", "resetme"]),
     ("☢️ Cleanup (ALL)",        ["wipeall", "resetall"]),
-    ("📢 Communication",        ["broadcast", "msg", "away", "block", "unblock"]),
+    ("📢 Communication",        ["broadcast", "msg", "away", "block", "unblock", "pin_msg"]),
     ("🎯 Targeting & Offers",   ["offer_tier", "offer_user", "offer_users", "retarget", "bulk_ids", "bulk_promo_users"]),
     ("🎉 Promotions",           ["promo_set", "promo_clear", "promo_status", "promo_send", "promo_personal"]),
-    ("⚙️ Settings",             ["fallback_toggle", "special_offers_toggle", "tier_gate", "proof_mode", "sleep", "sleep_visitors"]),
+    ("⚙️ Settings",             ["fallback_toggle", "special_offers_toggle", "tier_gate", "proof_mode", "preview_mode", "sleep", "sleep_visitors"]),
     ("💾 DB Backup",            ["backup", "restore", "import_csv"]),
     ("📋 Diagnostics",          ["logs"]),
     ("✅ Manual Approval",      ["approve", "reject"]),
